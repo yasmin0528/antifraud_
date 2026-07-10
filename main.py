@@ -20,7 +20,10 @@ def parse_args():
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter,
                             conflict_handler='resolve')
     parser.add_argument("--method", default=str)  # specify which method to use
-    method = vars(parser.parse_args())['method']  # dict
+    parser.add_argument("--dataset", default=None)
+    cli_args = vars(parser.parse_args())
+    method = cli_args['method']  # dict
+    dataset = cli_args['dataset']
 
     # if method in ['']:
     #     yaml_file = "config/base_cfg.yaml"
@@ -33,7 +36,7 @@ def parse_args():
     elif method in ['stagn']:
         yaml_file = "config/stagn_cfg.yaml"
     elif method in ['gtan']:
-        yaml_file = "config/gtan_cfg.yaml"
+        yaml_file = "config/gtan_aml_cfg.yaml" if dataset == "aml" else "config/gtan_cfg.yaml"
     elif method in ['rgtan']:
         yaml_file = "config/rgtan_cfg.yaml"
     elif method in ['hogrl']:
@@ -46,6 +49,8 @@ def parse_args():
     with open(yaml_file) as file:
         args = yaml.safe_load(file)
     args['method'] = method
+    if dataset is not None:
+        args['dataset'] = dataset
     return args
 
 
@@ -137,10 +142,10 @@ def main(args):
         )
     elif args['method'] == 'gtan':
         from methods.gtan.gtan_main import gtan_main, load_gtan_data
-        feat_data, labels, train_idx, test_idx, g, cat_features = load_gtan_data(
-            args['dataset'], args['test_size'])
+        feat_data, labels, train_idx, val_idx, test_idx, g, cat_features, split_meta = load_gtan_data(
+            args)
         gtan_main(
-            feat_data, g, train_idx, test_idx, labels, args, cat_features)
+            feat_data, g, train_idx, val_idx, test_idx, labels, args, cat_features, split_meta)
     elif args['method'] == 'rgtan':
         from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
         feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(

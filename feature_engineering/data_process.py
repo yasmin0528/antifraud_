@@ -185,6 +185,124 @@ def feat_map():
     return tensor_list, feat_names
 
 
+def _build_transaction_graph(data: pd.DataFrame, relation_columns, edge_per_trans: int = 3):
+    """Build a transaction-sample graph with relation-local temporal edges."""
+    all_src = []
+    all_tgt = []
+    for column in relation_columns:
+        src = []
+        tgt = []
+        for _, group_df in tqdm(data.groupby(column), desc=f"graph:{column}"):
+            group_df = group_df.sort_values(by="Time")
+            sorted_idxs = group_df.index.to_list()
+            group_len = len(sorted_idxs)
+            for i in range(group_len):
+                upper = min(i + edge_per_trans, group_len)
+                src.extend([sorted_idxs[i]] * (upper - i))
+                tgt.extend(sorted_idxs[i:upper])
+        all_src.extend(src)
+        all_tgt.extend(tgt)
+
+    graph = dgl.graph((np.array(all_src), np.array(all_tgt)), num_nodes=len(data))
+    graph = dgl.add_self_loop(graph)
+    return graph
+
+
+def preprocess_aml_for_gtan(
+    raw_csv_path: str,
+    output_dir: str = None,
+    force: bool = False,
+):
+    """Preprocess AMLdataset.csv into AML-specific GTAN artifacts."""
+    if output_dir is None:
+        output_dir = os.path.dirname(raw_csv_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    processed_path = os.path.join(output_dir, "AML_gtan_processed.csv")
+    feat_path = os.path.join(output_dir, "AML_gtan_feat_data.csv")
+    label_path = os.path.join(output_dir, "AML_gtan_label_data.csv")
+    graph_path = os.path.join(output_dir, "graph-aml.bin")
+
+    if (
+        not force
+        and os.path.exists(processed_path)
+        and os.path.exists(feat_path)
+        and os.path.exists(label_path)
+        and os.path.exists(graph_path)
+    ):
+        return {
+            "processed_path": processed_path,
+            "feat_path": feat_path,
+            "label_path": label_path,
+            "graph_path": graph_path,
+        }
+
+    data = pd.read_csv(raw_csv_path)
+    if data.columns[0].startswith("Unnamed"):
+        data = data.drop(columns=[data.columns[0]])
+
+    data["IS_FRAUD"] = data["IS_FRAUD"].astype(int)
+    data = data.sort_values(
+        by=["SENDER_ACCOUNT_ID", "TIMESTAMP", "TX_ID"]
+    ).reset_index(drop=True)
+
+    amount_mean = float(data["TX_AMOUNT"].mean())
+    amount_std = float(data["TX_AMOUNT"].std() + 1e-6)
+    data["TX_AMOUNT_NORM"] = (data["TX_AMOUNT"] - amount_mean) / amount_std
+    data["TX_LOG_AMOUNT"] = np.log1p(data["TX_AMOUNT"].clip(lower=0.0))
+    data["TIME_DIFF"] = (
+        data.groupby("SENDER_ACCOUNT_ID")["TIMESTAMP"].diff().fillna(0.0).astype(float)
+    )
+    data["SENDER_HIST_COUNT"] = data.groupby("SENDER_ACCOUNT_ID").cumcount().astype(float)
+    data["SENDER_HIST_AMOUNT_SUM"] = (
+        data.groupby("SENDER_ACCOUNT_ID")["TX_AMOUNT"].cumsum() - data["TX_AMOUNT"]
+    ).astype(float)
+    hist_count = data["SENDER_HIST_COUNT"].replace(0.0, np.nan)
+    data["SENDER_HIST_AMOUNT_MEAN"] = (
+        data["SENDER_HIST_AMOUNT_SUM"] / hist_count
+    ).fillna(0.0)
+    data["SENDER_PREV_FRAUD_COUNT"] = (
+        data.groupby("SENDER_ACCOUNT_ID")["IS_FRAUD"].cumsum() - data["IS_FRAUD"]
+    ).astype(float)
+
+    processed = pd.DataFrame(
+        {
+            "TX_ID": data["TX_ID"].astype(int),
+            "Source": data["SENDER_ACCOUNT_ID"].astype(str),
+            "Target": data["RECEIVER_ACCOUNT_ID"].astype(str),
+            "Type": data["TX_TYPE"].astype(str),
+            "Time": data["TIMESTAMP"].astype(float),
+            "Labels": data["IS_FRAUD"].astype(int),
+            "AlertID": data["ALERT_ID"].astype(int),
+            "Amount": data["TX_AMOUNT"].astype(float),
+            "AmountNorm": data["TX_AMOUNT_NORM"].astype(float),
+            "LogAmount": data["TX_LOG_AMOUNT"].astype(float),
+            "TimeDiff": data["TIME_DIFF"].astype(float),
+            "SenderHistCount": data["SENDER_HIST_COUNT"].astype(float),
+            "SenderHistAmountSum": data["SENDER_HIST_AMOUNT_SUM"].astype(float),
+            "SenderHistAmountMean": data["SENDER_HIST_AMOUNT_MEAN"].astype(float),
+            "SenderPrevFraudCount": data["SENDER_PREV_FRAUD_COUNT"].astype(float),
+        }
+    )
+
+    graph = _build_transaction_graph(processed, ["Source", "Target", "Type"])
+    labels = processed["Labels"].astype(int)
+    graph.ndata["label"] = torch.from_numpy(labels.to_numpy()).to(torch.long)
+
+    feat_data = processed.drop(columns=["Labels"])
+    feat_data.to_csv(feat_path, index=False)
+    labels.to_frame(name="Labels").to_csv(label_path, index=False)
+    processed.to_csv(processed_path, index=False)
+    dgl.data.utils.save_graphs(graph_path, [graph])
+
+    return {
+        "processed_path": processed_path,
+        "feat_path": feat_path,
+        "label_path": label_path,
+        "graph_path": graph_path,
+    }
+
+
 if __name__ == "__main__":
 
     set_seed(42)
