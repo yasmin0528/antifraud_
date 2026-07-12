@@ -39,6 +39,10 @@ def parse_args():
         yaml_file = "config/gtan_aml_cfg.yaml" if dataset == "aml" else "config/gtan_cfg.yaml"
     elif method in ['rgtan']:
         yaml_file = "config/rgtan_cfg.yaml"
+    elif method in ['rgtan_ca1']:
+        if dataset != "aml":
+            raise ValueError("rgtan_ca1 currently supports only --dataset aml")
+        yaml_file = "config/rgtan_aml_ca1.yaml"
     elif method in ['hogrl']:
         yaml_file = "config/hogrl_cfg.yaml"
         
@@ -146,12 +150,16 @@ def main(args):
             args)
         gtan_main(
             feat_data, g, train_idx, val_idx, test_idx, labels, args, cat_features, split_meta)
-    elif args['method'] == 'rgtan':
-        from methods.rgtan.rgtan_main import rgtan_main, loda_rgtan_data
+    elif args['method'] in {'rgtan', 'rgtan_ca1'}:
+        from methods.rgtan.rgtan_main import rgtan_main, rgtan_ca1_main, loda_rgtan_data
         feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
             args)
-        rgtan_main(feat_data, g, train_idx, test_idx, labels, args,
-                   cat_features, neigh_features, nei_att_head=args['nei_att_heads'][args['dataset']])
+        if args['method'] == 'rgtan_ca1':
+            rgtan_ca1_main(feat_data, g, train_idx, args['_val_idx'], test_idx, labels, args,
+                           cat_features, neigh_features, nei_att_head=args['nei_att_heads']['aml'])
+        else:
+            rgtan_main(feat_data, g, train_idx, test_idx, labels, args,
+                       cat_features, neigh_features, nei_att_head=args['nei_att_heads'][args['dataset']])
     elif args['method'] == 'hogrl':
         from methods.hogrl.hogrl_main import hogrl_main
         hogrl_main(args)

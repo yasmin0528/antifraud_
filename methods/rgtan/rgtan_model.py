@@ -434,6 +434,7 @@ class RGTAN(nn.Module):
                  cat_features=None,
                  neigh_features=None,
                  nei_att_head=4,
+                 ca1_hidden_dim=None,
                  device='cpu'):
         """
         Initialize the RGTAN-GNN model
@@ -463,6 +464,12 @@ class RGTAN(nn.Module):
         self.n_classes = n_classes
         self.heads = heads  # [4,4,4]
         self.activation = activation  # PRelu
+        self.use_ca1 = ca1_hidden_dim is not None
+        if self.use_ca1:
+            self.num_proj = nn.Linear(in_feats, in_feats)
+            self.ca1_proj = nn.Linear(ca1_hidden_dim, in_feats)
+            self.ca1_gate = nn.Linear(ca1_hidden_dim, 1)
+            self.ca1_norm = nn.LayerNorm(in_feats)
         # self.input_drop = lambda x: x
         self.input_drop = nn.Dropout(drop[0])
         self.drop = drop[1]
@@ -519,7 +526,8 @@ class RGTAN(nn.Module):
             self.layers.append(nn.Linear(self.hidden_dim *
                                self.heads[-1], self.n_classes))
 
-    def forward(self, blocks, features, labels, n2v_feat=None, neighstat_feat=None):
+    def forward(self, blocks, features, labels, n2v_feat=None, neighstat_feat=None,
+                ca1_embedding=None):
         """
         :param blocks: train blocks
         :param features: train features
@@ -527,6 +535,14 @@ class RGTAN(nn.Module):
         :param n2v_feat: whether to use n2v features
         :param neighstat_feat: neighbor riskstat features
         """
+        if self.use_ca1:
+            if ca1_embedding is None or ca1_embedding.shape[0] != features.shape[0]:
+                raise ValueError("CA1 embedding must align with all RGTAN input nodes")
+            features = self.ca1_norm(
+                self.num_proj(features)
+                + torch.sigmoid(self.ca1_gate(ca1_embedding)) * self.ca1_proj(ca1_embedding)
+            )
+
         if n2v_feat is None and neighstat_feat is None:
             h = features
         else:

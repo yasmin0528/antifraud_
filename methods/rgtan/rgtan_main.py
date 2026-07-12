@@ -1,4 +1,6 @@
 import os
+import copy
+import json
 from dgl.dataloading import MultiLayerFullNeighborSampler
 from dgl.dataloading import NodeDataLoader
 from torch.optim.lr_scheduler import MultiStepLR
@@ -19,6 +21,8 @@ from . import *
 from .rgtan_lpa import load_lpa_subtensor
 from .rgtan_model import RGTAN
 from feature_engineering.data_process import preprocess_aml_for_gtan
+from feature_engineering.ca1_cache import load_or_build_aml_ca1_cache
+from methods.modules.ca1 import CA1Encoder
 
 
 def _resolve_dataset_path(data_path: str) -> str:
@@ -86,6 +90,169 @@ def _build_aml_neigh_features(graph: dgl.DGLGraph, labels: pd.Series) -> pd.Data
             "1hop_risk_ratio": one_hop_ratio,
         }
     )
+
+
+def _seed_local_indices(input_nodes, seeds):
+    positions = {int(node): idx for idx, node in enumerate(input_nodes.detach().cpu().tolist())}
+    try:
+        return torch.tensor([positions[int(node)] for node in seeds.detach().cpu().tolist()],
+                            dtype=torch.long, device=input_nodes.device)
+    except KeyError as exc:
+        raise ValueError(f"Seed node {exc.args[0]} is absent from input_nodes") from exc
+
+
+def _append_ca1_results(args, metrics, cache):
+    results_dir = args.get("results_dir", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    result_path = os.path.join(results_dir, "results.csv")
+    row = {"method": "rgtan_ca1", "dataset": "aml", **metrics}
+    old_results = pd.read_csv(result_path) if os.path.exists(result_path) else pd.DataFrame()
+    pd.concat([old_results, pd.DataFrame([row])], ignore_index=True, sort=False).to_csv(
+        result_path, index=False)
+    metadata = {
+        "method": "rgtan_ca1", "dataset": "aml", "ca1_enabled": True,
+        "train_mode": "single_split", "ca1_k": args["ca1_k"],
+        "ca1_hidden_dim": args["ca1_hidden_dim"],
+        "ca1_aux_weight": args["ca1_aux_weight"],
+        "ca1_input_fields": cache["input_fields"],
+        "ca1_encoder_type": args["ca1_encoder_type"],
+        "ca1_pooling": args["ca1_pooling"],
+        "ca1_cache_fingerprint": cache["source_fingerprint"],
+        **metrics,
+    }
+    metadata_path = os.path.join(results_dir, "metadata.json")
+    previous = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, encoding="utf-8") as handle:
+                previous = json.load(handle)
+        except (json.JSONDecodeError, OSError):
+            previous = {}
+    previous.update(metadata)
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(previous, handle, ensure_ascii=False, indent=2)
+
+
+def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
+                   cat_features, neigh_features, nei_att_head):
+    device = torch.device(args["device"])
+    graph = graph.to(device)
+    num_feat = torch.from_numpy(feat_df.values).float().to(device)
+    cat_feat = {col: torch.from_numpy(feat_df[col].values).long().to(device)
+                for col in cat_features}
+    nei_feat = ({col: torch.from_numpy(neigh_features[col].values).float().to(device)
+                 for col in neigh_features.columns}
+                if isinstance(neigh_features, pd.DataFrame) else [])
+    label_tensor = torch.from_numpy(labels.values).long().to(device)
+    cache = load_or_build_aml_ca1_cache(
+        args["_aml_processed_path"], args["ca1_cache_path"],
+        args["_aml_sample_ids"], args["ca1_k"])
+    if cache["num_rows"] != len(feat_df) or cache["num_rows"] != graph.num_nodes():
+        raise ValueError("CA1 cache, feature rows, and graph nodes are not aligned")
+    ca1_sequence = cache["sequence"]
+    ca1_len = cache["sequence_len"]
+    ca1_mask = cache["padding_mask"]
+
+    def loader(indices, shuffle):
+        sampler = MultiLayerFullNeighborSampler(args["n_layers"])
+        nodes = torch.as_tensor(indices, dtype=torch.long, device=device)
+        return NodeDataLoader(graph, nodes, sampler, device=device, use_ddp=False,
+                              batch_size=args["batch_size"], shuffle=shuffle,
+                              drop_last=False, num_workers=0)
+
+    train_loader, val_loader, test_loader = (
+        loader(train_idx, True), loader(val_idx, False), loader(test_idx, False))
+    model = RGTAN(
+        in_feats=feat_df.shape[1], hidden_dim=args["hid_dim"] // 4, n_classes=2,
+        heads=[4] * args["n_layers"], activation=nn.PReLU(), n_layers=args["n_layers"],
+        drop=args["dropout"], device=device, gated=args["gated"], ref_df=feat_df,
+        cat_features=cat_feat, neigh_features=nei_feat, nei_att_head=nei_att_head,
+        ca1_hidden_dim=args["ca1_hidden_dim"],
+    ).to(device)
+    ca1 = CA1Encoder(4, args["ca1_hidden_dim"], args["ca1_dropout"],
+                     args["ca1_encoder_type"], args["ca1_pooling"]).to(device)
+    lr = args["lr"] * np.sqrt(args["batch_size"] / 1024)
+    optimizer = optim.Adam(list(model.parameters()) + list(ca1.parameters()),
+                           lr=lr, weight_decay=args["wd"])
+    scheduler = MultiStepLR(optimizer, milestones=[4000, 12000], gamma=0.3)
+    main_loss_fn = nn.CrossEntropyLoss().to(device)
+    aux_loss_fn = nn.BCEWithLogitsLoss().to(device)
+    best_loss, stale, best_state = float("inf"), 0, None
+
+    def forward_batch(input_nodes, seeds, blocks):
+        batch = load_lpa_subtensor(num_feat, cat_feat, nei_feat, {}, label_tensor,
+                                   seeds, input_nodes, device, blocks)
+        inputs, work_inputs, neigh_inputs, batch_labels, lpa_labels = batch
+        cpu_nodes = input_nodes.detach().cpu().long()
+        embedding, micro_logits, _ = ca1(
+            ca1_sequence[cpu_nodes].to(device), ca1_len[cpu_nodes].to(device),
+            ca1_mask[cpu_nodes].to(device))
+        local_idx = _seed_local_indices(input_nodes, seeds)
+        logits = model([block.to(device) for block in blocks], inputs, lpa_labels,
+                       work_inputs, neigh_inputs, ca1_embedding=embedding)
+        return logits, micro_logits[local_idx], batch_labels
+
+    for epoch in range(args["max_epochs"]):
+        model.train(); ca1.train()
+        train_main, train_aux, train_total = [], [], []
+        for input_nodes, seeds, blocks in train_loader:
+            logits, micro_logits, batch_labels = forward_batch(input_nodes, seeds, blocks)
+            valid = batch_labels != 2
+            if not valid.any():
+                continue
+            main_loss = main_loss_fn(logits[valid], batch_labels[valid])
+            aux_loss = aux_loss_fn(micro_logits[valid].squeeze(-1), batch_labels[valid].float())
+            total_loss = main_loss + args["ca1_aux_weight"] * aux_loss
+            optimizer.zero_grad(); total_loss.backward(); optimizer.step(); scheduler.step()
+            train_main.append(main_loss.item()); train_aux.append(aux_loss.item()); train_total.append(total_loss.item())
+
+        model.eval(); ca1.eval(); val_sum, val_count = 0.0, 0
+        with torch.no_grad():
+            for input_nodes, seeds, blocks in val_loader:
+                logits, _, batch_labels = forward_batch(input_nodes, seeds, blocks)
+                valid = batch_labels != 2
+                if valid.any():
+                    count = int(valid.sum())
+                    val_sum += main_loss_fn(logits[valid], batch_labels[valid]).item() * count
+                    val_count += count
+        val_loss = val_sum / max(val_count, 1)
+        print(f"epoch={epoch:03d} main_loss={np.mean(train_main):.6f} "
+              f"ca1_aux_loss={np.mean(train_aux):.6f} total_loss={np.mean(train_total):.6f} "
+              f"val_loss={val_loss:.6f}")
+        if val_loss < best_loss:
+            best_loss, stale = val_loss, 0
+            best_state = {"epoch": epoch, "model": copy.deepcopy(model.state_dict()),
+                          "ca1": copy.deepcopy(ca1.state_dict()),
+                          "optimizer": copy.deepcopy(optimizer.state_dict()), "args": dict(args)}
+            os.makedirs(os.path.dirname(args["checkpoint_path"]) or ".", exist_ok=True)
+            torch.save(best_state, args["checkpoint_path"])
+        else:
+            stale += 1
+            if stale >= args["early_stopping"]:
+                break
+
+    if best_state is None:
+        raise RuntimeError("No valid CA1 training/validation batch was produced")
+    model.load_state_dict(best_state["model"]); ca1.load_state_dict(best_state["ca1"])
+    optimizer.load_state_dict(best_state["optimizer"])
+    model.eval(); ca1.eval(); scores, truths, preds = [], [], []
+    with torch.no_grad():
+        for input_nodes, seeds, blocks in test_loader:
+            logits, _, batch_labels = forward_batch(input_nodes, seeds, blocks)
+            valid = batch_labels != 2
+            probabilities = torch.softmax(logits[valid], dim=1)[:, 1]
+            scores.extend(probabilities.cpu().tolist())
+            truths.extend(batch_labels[valid].cpu().tolist())
+            preds.extend(torch.argmax(logits[valid], dim=1).cpu().tolist())
+    metrics = {
+        "auc": float(roc_auc_score(truths, scores)),
+        "f1": float(f1_score(truths, preds, average="macro")),
+        "ap": float(average_precision_score(truths, scores)),
+        "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
+    }
+    print("test AUC:", metrics["auc"]); print("test f1:", metrics["f1"]); print("test AP:", metrics["ap"])
+    _append_ca1_results(args, metrics, cache)
+    return metrics
 
 
 def rgtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, neigh_features: pd.DataFrame, nei_att_head):
@@ -449,6 +616,10 @@ def loda_rgtan_data(args):
         feat_data = pd.read_csv(artifact_paths["feat_path"])
         labels = pd.read_csv(artifact_paths["label_path"])["Labels"].astype(int)
         g = dgl.load_graphs(artifact_paths["graph_path"])[0][0]
+        processed_ids = processed["TX_ID"].astype(str).tolist()
+        feature_ids = feat_data["TX_ID"].astype(str).tolist()
+        if processed_ids != feature_ids or len(processed_ids) != g.num_nodes():
+            raise ValueError("AML processed rows, feature rows, and graph node IDs are misaligned")
 
         for col in cat_features:
             le = LabelEncoder()
@@ -464,6 +635,21 @@ def loda_rgtan_data(args):
             test_size=test_size,
             seed=args["seed"],
         )
+        if args.get("method") == "rgtan_ca1":
+            remaining_groups = processed.iloc[train_idx]["Source"].reset_index(drop=True)
+            remaining_labels = processed.iloc[train_idx]["Labels"].reset_index(drop=True)
+            relative_train, relative_val = _sender_account_train_test_split(
+                remaining_groups, remaining_labels, test_size=args["val_size"], seed=args["seed"] + 1)
+            original_train = np.asarray(train_idx)
+            train_idx, val_idx = original_train[relative_train], original_train[relative_val]
+            train_senders = set(processed.iloc[train_idx]["Source"].astype(str))
+            val_senders = set(processed.iloc[val_idx]["Source"].astype(str))
+            test_senders = set(processed.iloc[test_idx]["Source"].astype(str))
+            if train_senders & val_senders or train_senders & test_senders or val_senders & test_senders:
+                raise RuntimeError("AML sender-account split leakage detected")
+            args["_val_idx"] = val_idx
+            args["_aml_processed_path"] = artifact_paths["processed_path"]
+            args["_aml_sample_ids"] = processed_ids
         neigh_features = _build_aml_neigh_features(g, labels)
         print("AML neighborhood features generated for RGTAN input.")
     else:
