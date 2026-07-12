@@ -19,6 +19,25 @@ from . import *
 from feature_engineering.data_process import preprocess_aml_for_gtan
 
 
+def _resolve_dataset_path(data_path: str) -> str:
+    """Resolve dataset paths relative to the project root first."""
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidate_paths = []
+
+    if os.path.isabs(data_path):
+        candidate_paths.append(data_path)
+    else:
+        candidate_paths.append(os.path.abspath(os.path.join(project_root, data_path)))
+        candidate_paths.append(os.path.abspath(os.path.join(os.getcwd(), data_path)))
+        candidate_paths.append(os.path.abspath(data_path))
+
+    for candidate in candidate_paths:
+        if os.path.exists(candidate):
+            return candidate
+
+    return candidate_paths[0]
+
+
 def _group_train_test_val_split(
     group_ids: pd.Series,
     labels: pd.Series,
@@ -478,8 +497,8 @@ def load_gtan_data(args: dict):
 
     elif dataset == "aml":
         cat_features = ["Target", "Type"]
-        data_path = args.get("data_path", "data/AMLdataset.csv")
-        raw_csv_path = data_path if os.path.isabs(data_path) else os.path.join(os.path.dirname(__file__), "..", "..", data_path)
+        data_path = args.get("data_path", "../AMLdataset.csv")
+        raw_csv_path = _resolve_dataset_path(data_path)
         artifact_paths = preprocess_aml_for_gtan(raw_csv_path, output_dir=prefix)
 
         processed = pd.read_csv(artifact_paths["processed_path"])
