@@ -25,7 +25,6 @@ ca1_input_fields: ["amount_norm", "log_amount", "tx_type_id", "time_diff"]
 ca1_encoder_type: "gru"
 ca1_pooling: "attention"
 ca1_cache_path: data/cache/aml_ca1_k10.pt
-checkpoint_path: results/rgtan_aml_ca1_best.pt
 results_dir: results
 
 nei_att_heads:

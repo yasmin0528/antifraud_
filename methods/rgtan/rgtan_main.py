@@ -1,6 +1,8 @@
 import os
 import copy
 import json
+import time
+from datetime import datetime
 from dgl.dataloading import MultiLayerFullNeighborSampler
 from dgl.dataloading import NodeDataLoader
 from torch.optim.lr_scheduler import MultiStepLR
@@ -101,16 +103,26 @@ def _seed_local_indices(input_nodes, seeds):
         raise ValueError(f"Seed node {exc.args[0]} is absent from input_nodes") from exc
 
 
-def _append_ca1_results(args, metrics, cache):
-    results_dir = args.get("results_dir", "results")
-    os.makedirs(results_dir, exist_ok=True)
-    result_path = os.path.join(results_dir, "results.csv")
-    row = {"method": "rgtan_ca1", "dataset": "aml", **metrics}
-    old_results = pd.read_csv(result_path) if os.path.exists(result_path) else pd.DataFrame()
-    pd.concat([old_results, pd.DataFrame([row])], ignore_index=True, sort=False).to_csv(
-        result_path, index=False)
+def _classification_metrics(truths, scores, preds):
+    if not truths:
+        return {"auc": float("nan"), "ap": float("nan"), "f1": float("nan")}
+    truths = np.asarray(truths)
+    result = {
+        "ap": float(average_precision_score(truths, scores)),
+        "f1": float(f1_score(truths, preds, average="macro")),
+    }
+    result["auc"] = (float(roc_auc_score(truths, scores))
+                     if np.unique(truths).size > 1 else float("nan"))
+    return result
+
+
+def _save_ca1_results(args, metrics, cache, run_dir, run_id, started_at):
+    row = {"run_id": run_id, "method": "rgtan_ca1", "dataset": "aml", **metrics}
+    pd.DataFrame([row]).to_csv(os.path.join(run_dir, "final_metrics.csv"), index=False)
     metadata = {
-        "method": "rgtan_ca1", "dataset": "aml", "ca1_enabled": True,
+        "run_id": run_id, "method": "rgtan_ca1", "dataset": "aml",
+        "started_at": started_at, "finished_at": datetime.now().astimezone().isoformat(),
+        "ca1_enabled": True,
         "train_mode": "single_split", "ca1_k": args["ca1_k"],
         "ca1_hidden_dim": args["ca1_hidden_dim"],
         "ca1_aux_weight": args["ca1_aux_weight"],
@@ -120,21 +132,21 @@ def _append_ca1_results(args, metrics, cache):
         "ca1_cache_fingerprint": cache["source_fingerprint"],
         **metrics,
     }
-    metadata_path = os.path.join(results_dir, "metadata.json")
-    previous = {}
-    if os.path.exists(metadata_path):
-        try:
-            with open(metadata_path, encoding="utf-8") as handle:
-                previous = json.load(handle)
-        except (json.JSONDecodeError, OSError):
-            previous = {}
-    previous.update(metadata)
-    with open(metadata_path, "w", encoding="utf-8") as handle:
-        json.dump(previous, handle, ensure_ascii=False, indent=2)
+    with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
 
 
 def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
                    cat_features, neigh_features, nei_att_head):
+    started_at = datetime.now().astimezone().isoformat()
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = f"rgtan_ca1_aml_seed{args['seed']}_{run_stamp}"
+    run_dir = os.path.join(args.get("results_dir", "results"), run_id)
+    os.makedirs(run_dir, exist_ok=False)
+    checkpoint_path = os.path.join(run_dir, "best_checkpoint.pt")
+    history_path = os.path.join(run_dir, "epoch_history.csv")
+    print(f"Experiment run: {run_id}")
+    print(f"Artifacts: {os.path.abspath(run_dir)}")
     device = torch.device(args["device"])
     graph = graph.to(device)
     num_feat = torch.from_numpy(feat_df.values).float().to(device)
@@ -192,10 +204,15 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
                        work_inputs, neigh_inputs, ca1_embedding=embedding)
         return logits, micro_logits[local_idx], batch_labels
 
-    for epoch in range(args["max_epochs"]):
+    epoch_bar = tqdm(range(args["max_epochs"]), desc="epochs", unit="epoch")
+    for epoch in epoch_bar:
+        epoch_started = time.perf_counter()
         model.train(); ca1.train()
         train_main, train_aux, train_total = [], [], []
-        for input_nodes, seeds, blocks in train_loader:
+        train_truths, train_scores, train_preds = [], [], []
+        train_bar = tqdm(train_loader, desc=f"epoch {epoch + 1:02d} train",
+                         unit="batch", leave=False)
+        for input_nodes, seeds, blocks in train_bar:
             logits, micro_logits, batch_labels = forward_batch(input_nodes, seeds, blocks)
             valid = batch_labels != 2
             if not valid.any():
@@ -205,27 +222,65 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
             total_loss = main_loss + args["ca1_aux_weight"] * aux_loss
             optimizer.zero_grad(); total_loss.backward(); optimizer.step(); scheduler.step()
             train_main.append(main_loss.item()); train_aux.append(aux_loss.item()); train_total.append(total_loss.item())
+            probabilities = torch.softmax(logits[valid].detach(), dim=1)[:, 1]
+            train_truths.extend(batch_labels[valid].detach().cpu().tolist())
+            train_scores.extend(probabilities.cpu().tolist())
+            train_preds.extend(torch.argmax(logits[valid].detach(), dim=1).cpu().tolist())
+            train_bar.set_postfix(loss=f"{total_loss.item():.4f}")
 
         model.eval(); ca1.eval(); val_sum, val_count = 0.0, 0
+        val_aux_sum, val_total_sum = 0.0, 0.0
+        val_truths, val_scores, val_preds = [], [], []
         with torch.no_grad():
-            for input_nodes, seeds, blocks in val_loader:
-                logits, _, batch_labels = forward_batch(input_nodes, seeds, blocks)
+            val_bar = tqdm(val_loader, desc=f"epoch {epoch + 1:02d} val",
+                           unit="batch", leave=False)
+            for input_nodes, seeds, blocks in val_bar:
+                logits, micro_logits, batch_labels = forward_batch(input_nodes, seeds, blocks)
                 valid = batch_labels != 2
                 if valid.any():
                     count = int(valid.sum())
-                    val_sum += main_loss_fn(logits[valid], batch_labels[valid]).item() * count
+                    batch_main = main_loss_fn(logits[valid], batch_labels[valid])
+                    batch_aux = aux_loss_fn(micro_logits[valid].squeeze(-1), batch_labels[valid].float())
+                    batch_total = batch_main + args["ca1_aux_weight"] * batch_aux
+                    val_sum += batch_main.item() * count
+                    val_aux_sum += batch_aux.item() * count
+                    val_total_sum += batch_total.item() * count
                     val_count += count
+                    probabilities = torch.softmax(logits[valid], dim=1)[:, 1]
+                    val_truths.extend(batch_labels[valid].cpu().tolist())
+                    val_scores.extend(probabilities.cpu().tolist())
+                    val_preds.extend(torch.argmax(logits[valid], dim=1).cpu().tolist())
         val_loss = val_sum / max(val_count, 1)
-        print(f"epoch={epoch:03d} main_loss={np.mean(train_main):.6f} "
-              f"ca1_aux_loss={np.mean(train_aux):.6f} total_loss={np.mean(train_total):.6f} "
-              f"val_loss={val_loss:.6f}")
-        if val_loss < best_loss:
+        improved = val_loss < best_loss
+        train_metrics = _classification_metrics(train_truths, train_scores, train_preds)
+        val_metrics = _classification_metrics(val_truths, val_scores, val_preds)
+        epoch_row = {
+            "run_id": run_id, "timestamp": datetime.now().astimezone().isoformat(),
+            "epoch": epoch + 1, "epoch_seconds": time.perf_counter() - epoch_started,
+            "train_main_loss": float(np.mean(train_main)),
+            "train_ca1_aux_loss": float(np.mean(train_aux)),
+            "train_total_loss": float(np.mean(train_total)),
+            "train_auc": train_metrics["auc"], "train_ap": train_metrics["ap"],
+            "train_f1": train_metrics["f1"], "val_main_loss": val_loss,
+            "val_ca1_aux_loss": val_aux_sum / max(val_count, 1),
+            "val_total_loss": val_total_sum / max(val_count, 1),
+            "val_auc": val_metrics["auc"], "val_ap": val_metrics["ap"],
+            "val_f1": val_metrics["f1"], "is_best": improved,
+        }
+        pd.DataFrame([epoch_row]).to_csv(
+            history_path, mode="a", header=not os.path.exists(history_path), index=False)
+        epoch_bar.set_postfix(val_loss=f"{val_loss:.4f}", val_auc=f"{val_metrics['auc']:.4f}",
+                              val_ap=f"{val_metrics['ap']:.4f}", best=improved)
+        print(f"[{epoch_row['timestamp']}] epoch={epoch + 1:03d} "
+              f"train_auc={train_metrics['auc']:.4f} train_ap={train_metrics['ap']:.4f} "
+              f"train_f1={train_metrics['f1']:.4f} val_auc={val_metrics['auc']:.4f} "
+              f"val_ap={val_metrics['ap']:.4f} val_f1={val_metrics['f1']:.4f}")
+        if improved:
             best_loss, stale = val_loss, 0
             best_state = {"epoch": epoch, "model": copy.deepcopy(model.state_dict()),
                           "ca1": copy.deepcopy(ca1.state_dict()),
                           "optimizer": copy.deepcopy(optimizer.state_dict()), "args": dict(args)}
-            os.makedirs(os.path.dirname(args["checkpoint_path"]) or ".", exist_ok=True)
-            torch.save(best_state, args["checkpoint_path"])
+            torch.save(best_state, checkpoint_path)
         else:
             stale += 1
             if stale >= args["early_stopping"]:
@@ -237,21 +292,24 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
     optimizer.load_state_dict(best_state["optimizer"])
     model.eval(); ca1.eval(); scores, truths, preds = [], [], []
     with torch.no_grad():
-        for input_nodes, seeds, blocks in test_loader:
+        test_bar = tqdm(test_loader, desc="best checkpoint test", unit="batch", leave=False)
+        for input_nodes, seeds, blocks in test_bar:
             logits, _, batch_labels = forward_batch(input_nodes, seeds, blocks)
             valid = batch_labels != 2
             probabilities = torch.softmax(logits[valid], dim=1)[:, 1]
             scores.extend(probabilities.cpu().tolist())
             truths.extend(batch_labels[valid].cpu().tolist())
             preds.extend(torch.argmax(logits[valid], dim=1).cpu().tolist())
+    test_metrics = _classification_metrics(truths, scores, preds)
     metrics = {
-        "auc": float(roc_auc_score(truths, scores)),
-        "f1": float(f1_score(truths, preds, average="macro")),
-        "ap": float(average_precision_score(truths, scores)),
+        "auc": test_metrics["auc"], "f1": test_metrics["f1"], "ap": test_metrics["ap"],
         "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
+        "best_epoch": int(best_state["epoch"]) + 1, "best_val_loss": float(best_loss),
+        "duration_seconds": (datetime.now().astimezone()
+                             - datetime.fromisoformat(started_at)).total_seconds(),
     }
     print("test AUC:", metrics["auc"]); print("test f1:", metrics["f1"]); print("test AP:", metrics["ap"])
-    _append_ca1_results(args, metrics, cache)
+    _save_ca1_results(args, metrics, cache, run_dir, run_id, started_at)
     return metrics
 
 
