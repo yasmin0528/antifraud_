@@ -12,7 +12,10 @@ max_epochs: 15
 gated: True
 dataset: S-FFSD
 test_size: 0.6
+data_path: ../AMLdataset.csv
+split_mode: sender_account
 nei_att_heads:
     yelp: 4
     amazon: 5
     S-FFSD: 9
+    aml: 1

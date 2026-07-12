@@ -18,6 +18,74 @@ from tqdm import tqdm
 from . import *
 from .rgtan_lpa import load_lpa_subtensor
 from .rgtan_model import RGTAN
+from feature_engineering.data_process import preprocess_aml_for_gtan
+
+
+def _resolve_dataset_path(data_path: str) -> str:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidate_paths = []
+    if os.path.isabs(data_path):
+        candidate_paths.append(data_path)
+    else:
+        candidate_paths.append(os.path.abspath(os.path.join(project_root, data_path)))
+        candidate_paths.append(os.path.abspath(os.path.join(os.getcwd(), data_path)))
+        candidate_paths.append(os.path.abspath(data_path))
+
+    for candidate in candidate_paths:
+        if os.path.exists(candidate):
+            return candidate
+    return candidate_paths[0]
+
+
+def _sender_account_train_test_split(
+    group_ids: pd.Series,
+    labels: pd.Series,
+    test_size: float,
+    seed: int,
+):
+    group_df = pd.DataFrame({"group_id": group_ids.astype(str), "label": labels.astype(int)})
+    group_level = group_df.groupby("group_id")["label"].max().reset_index()
+    group_list = group_level["group_id"].to_numpy()
+    group_labels = group_level["label"]
+
+    stratify = None
+    if group_labels.nunique() >= 2 and group_labels.value_counts().min() >= 2:
+        stratify = group_labels
+    else:
+        print("Warning: AML sender-account stratified split unavailable, falling back to non-stratified split.")
+
+    train_groups, test_groups = train_test_split(
+        group_list,
+        test_size=test_size,
+        random_state=seed,
+        shuffle=True,
+        stratify=stratify,
+    )
+    train_mask = group_ids.astype(str).isin(train_groups)
+    test_mask = group_ids.astype(str).isin(test_groups)
+    return np.flatnonzero(train_mask.to_numpy()), np.flatnonzero(test_mask.to_numpy())
+
+
+def _build_aml_neigh_features(graph: dgl.DGLGraph, labels: pd.Series) -> pd.DataFrame:
+    num_nodes = graph.num_nodes()
+    src, dst = graph.edges()
+    src_np = src.cpu().numpy()
+    dst_np = dst.cpu().numpy()
+    label_np = labels.to_numpy().astype(np.float32)
+
+    in_degree = graph.in_degrees().cpu().numpy().astype(np.float32)
+    out_degree = graph.out_degrees().cpu().numpy().astype(np.float32)
+    one_hop_risk = np.bincount(src_np, weights=label_np[dst_np], minlength=num_nodes).astype(np.float32)
+    one_hop_ratio = one_hop_risk / np.maximum(out_degree, 1.0)
+
+    return pd.DataFrame(
+        {
+            "degree": in_degree,
+            "out_degree": out_degree,
+            "1hop_riskstat": one_hop_risk,
+            "1hop_risk_ratio": one_hop_ratio,
+        }
+    )
 
 
 def rgtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, neigh_features: pd.DataFrame, nei_att_head):
@@ -239,9 +307,11 @@ def rgtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, 
     print("test AP:", average_precision_score(y_target, test_score))
 
 
-def loda_rgtan_data(dataset: str, test_size: float):
+def loda_rgtan_data(args):
     # prefix = "./antifraud/data/"
     prefix = "data/"
+    dataset = args["dataset"]
+    test_size = args["test_size"]
     if dataset == 'S-FFSD':
         cat_features = ["Target", "Location", "Type"]
 
@@ -368,5 +438,35 @@ def loda_rgtan_data(dataset: str, test_size: float):
             neigh_features = feat_neigh
         except:
             print("no neighbohood feature used.")
+
+    elif dataset == 'aml':
+        cat_features = ["Target", "Type"]
+        data_path = args.get("data_path", "../AMLdataset.csv")
+        raw_csv_path = _resolve_dataset_path(data_path)
+        artifact_paths = preprocess_aml_for_gtan(raw_csv_path, output_dir=prefix)
+
+        processed = pd.read_csv(artifact_paths["processed_path"])
+        feat_data = pd.read_csv(artifact_paths["feat_path"])
+        labels = pd.read_csv(artifact_paths["label_path"])["Labels"].astype(int)
+        g = dgl.load_graphs(artifact_paths["graph_path"])[0][0]
+
+        for col in cat_features:
+            le = LabelEncoder()
+            feat_data[col] = le.fit_transform(feat_data[col].astype(str))
+
+        feat_data = feat_data.drop(columns=["Source"])
+        if "AlertID" in feat_data.columns:
+            feat_data["AlertID"] = feat_data["AlertID"].astype(int)
+
+        train_idx, test_idx = _sender_account_train_test_split(
+            processed["Source"],
+            processed["Labels"],
+            test_size=test_size,
+            seed=args["seed"],
+        )
+        neigh_features = _build_aml_neigh_features(g, labels)
+        print("AML neighborhood features generated for RGTAN input.")
+    else:
+        raise NotImplementedError(f"Unsupported RGTAN dataset: {dataset}")
 
     return feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features
