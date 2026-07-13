@@ -4,6 +4,7 @@ import torch
 from feature_engineering.ca1_cache import build_aml_ca1_cache
 from methods.modules.ca1 import CA1Encoder
 from methods.rgtan.rgtan_main import _seed_local_indices
+from methods.rgtan.rgtan_lpa import load_lpa_subtensor
 
 
 def test_cache_uses_only_prior_sender_history(tmp_path):
@@ -39,3 +40,15 @@ def test_seed_mapping_does_not_assume_prefix_order():
     input_nodes = torch.tensor([8, 3, 5, 1])
     seeds = torch.tensor([1, 8])
     assert _seed_local_indices(input_nodes, seeds).tolist() == [3, 0]
+
+
+def test_label_propagation_uses_train_whitelist_and_masks_seed():
+    node_feat = torch.zeros(4, 2)
+    labels = torch.tensor([0, 1, 1, 0])
+    known = torch.tensor([0, 2, 1, 2])
+    input_nodes = torch.tensor([2, 0, 3, 1])
+    seeds = torch.tensor([0])
+    result = load_lpa_subtensor(
+        node_feat, {}, {}, {}, labels, seeds, input_nodes, "cpu", [], known)
+    propagated = result[-1]
+    assert propagated.tolist() == [1, 2, 2, 2]

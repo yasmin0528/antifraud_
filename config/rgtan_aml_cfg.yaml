@@ -1,0 +1,21 @@
+batch_size: 64
+hid_dim: 256
+lr: 0.003
+wd: 0.0001
+n_layers: 2
+dropout: [0.2, 0.1]
+device: "cuda:0"
+early_stopping: 10
+seed: 2023
+max_epochs: 15
+gated: true
+
+dataset: aml
+data_path: ../AMLdataset.csv
+split_mode: sender_account
+val_size: 0.2
+test_size: 0.2
+results_dir: results
+
+nei_att_heads:
+  aml: 1

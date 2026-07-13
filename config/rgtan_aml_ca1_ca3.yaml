@@ -1,0 +1,46 @@
+batch_size: 64
+hid_dim: 256
+lr: 0.003
+wd: 0.0001
+n_layers: 2
+dropout: [0.2, 0.1]
+device: "cuda:0"
+early_stopping: 10
+seed: 2023
+max_epochs: 15
+gated: true
+
+dataset: aml
+data_path: ../AMLdataset.csv
+split_mode: sender_account
+val_size: 0.2
+test_size: 0.2
+
+use_ca1: true
+ca1_k: 10
+ca1_hidden_dim: 64
+ca1_aux_weight: 0.05
+ca1_dropout: 0.1
+ca1_input_fields: ["amount_norm", "log_amount", "tx_type_id", "time_diff"]
+ca1_encoder_type: "gru"
+ca1_pooling: "attention"
+ca1_cache_path: data/cache/aml_ca1_k10.pt
+
+use_ca3: true
+ca3_warmup_epochs: 3
+ca3_num_prototypes: 16
+ca3_init_method: minibatch_kmeans
+ca3_init_split: train
+ca3_init_label: positive_only
+ca3_update: gradient
+ca3_use_ema: false
+ca3_use_group_id: false
+ca3_temperature: 0.2
+ca3_top_k: 3
+ca3_aux_weight: 0.05
+ca3_diversity_weight: 0.001
+ca3_fusion: gated_residual
+
+results_dir: results
+nei_att_heads:
+  aml: 1

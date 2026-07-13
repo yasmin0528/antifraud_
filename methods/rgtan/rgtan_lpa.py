@@ -11,6 +11,7 @@ def load_lpa_subtensor(
     input_nodes,  # (|batch_all|,)
     device,
     blocks,
+    propagate_source_labels=None,
 ):
     """
     Put the input data into the device
@@ -46,7 +47,9 @@ def load_lpa_subtensor(
             device) for col in neigh_feat.keys()}
 
     batch_labels = labels[seeds].to(device)
-    train_labels = copy.deepcopy(labels)
-    propagate_labels = train_labels[input_nodes]  # (|input_nodes|,) 45324
-    propagate_labels[:seeds.shape[0]] = 2
+    source_labels = labels if propagate_source_labels is None else propagate_source_labels
+    propagate_labels = source_labels[input_nodes].clone()
+    # Explicitly mask output seeds; never rely on seeds being an input_nodes prefix.
+    seed_positions = (input_nodes.unsqueeze(1) == seeds.unsqueeze(0)).any(dim=1)
+    propagate_labels[seed_positions] = 2
     return batch_inputs, batch_work_inputs, batch_neighstat_inputs, batch_labels, propagate_labels.to(device)
