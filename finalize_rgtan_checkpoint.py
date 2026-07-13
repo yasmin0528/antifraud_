@@ -68,6 +68,25 @@ def _infer_method(checkpoint):
     raise ValueError("Unrecognized RGTAN checkpoint schema")
 
 
+def _load_rgtan_state(model, state_dict):
+    """Restore lazily registered categorical-embedding aliases before loading.
+
+    ``TransEmbedding.forward_emb`` assigns ``emb_dict = cat_table`` on the
+    first forward. Checkpoints saved after training therefore contain both
+    names, while a freshly constructed model initially contains only
+    ``cat_table``. Recreate that exact registered alias and retain strict state
+    loading for every real parameter.
+    """
+    if state_dict is None:
+        raise ValueError("Checkpoint does not contain an RGTAN state_dict")
+    has_lazy_alias = any(key.startswith("n2v_mlp.emb_dict.") for key in state_dict)
+    embedding_module = getattr(model, "n2v_mlp", None)
+    if has_lazy_alias and hasattr(embedding_module, "cat_table"):
+        if getattr(embedding_module, "emb_dict", None) is None:
+            embedding_module.emb_dict = embedding_module.cat_table
+    model.load_state_dict(state_dict, strict=True)
+
+
 def _load_run_args(run_dir, checkpoint, method, device_override):
     config_path = run_dir / "config_resolved.yaml"
     if config_path.is_file():
@@ -207,7 +226,8 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             ca1_len = cache["sequence_len"]
             ca1_mask = cache["padding_mask"]
         model = RGTAN(**model_kwargs).to(device)
-        model.load_state_dict(checkpoint.get("rgtan_state_dict", checkpoint.get("model")))
+        _load_rgtan_state(
+            model, checkpoint.get("rgtan_state_dict", checkpoint.get("model")))
         if ca1 is not None:
             ca1.load_state_dict(checkpoint.get("ca1_state_dict", checkpoint.get("ca1")))
             ca1.eval()
