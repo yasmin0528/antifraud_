@@ -107,8 +107,20 @@ def _classification_metrics(truths, scores, preds):
 
 
 def _save_ca1_results(args, metrics, cache, run_dir, run_id, started_at):
-    row = {"run_id": run_id, "method": "rgtan_ca1", "dataset": "aml", **metrics}
-    pd.DataFrame([row]).to_csv(os.path.join(run_dir, "final_metrics.csv"), index=False)
+    final = {
+        "run_id": run_id, "method": "rgtan_ca1", "dataset": "aml", "seed": args["seed"],
+        "test_auc": metrics["auc"], "test_ap": metrics["ap"], "test_f1": metrics["f1"],
+        "test_precision": metrics["precision"], "test_recall": metrics["recall"],
+        "test_threshold": metrics["test_threshold"],
+        "val_auc_at_best": metrics["val_auc_at_best"],
+        "val_ap_at_best": metrics["val_ap_at_best"],
+        "val_f1_at_best": metrics["val_f1_at_best"],
+        "best_epoch": metrics["best_epoch"], "best_val_loss": metrics["best_val_loss"],
+        "duration_seconds": metrics["duration_seconds"],
+        "train_size": metrics["train_size"], "val_size": metrics["val_size"],
+        "test_size": metrics["test_size"], "ca1_enabled": True, "ca3_enabled": False,
+    }
+    pd.DataFrame([final]).to_csv(os.path.join(run_dir, "final_metrics.csv"), index=False)
     metadata = {
         "run_id": run_id, "method": "rgtan_ca1", "dataset": "aml",
         "started_at": started_at, "finished_at": datetime.now().astimezone().isoformat(),
@@ -125,10 +137,19 @@ def _save_ca1_results(args, metrics, cache, run_dir, run_id, started_at):
         "label_propagation_scope": "train_only",
         "amount_normalization_scope": "train_split",
         "graph_feature_setting": "transductive_features_train_labels_only",
-        **metrics,
+        **final,
     }
     with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    results_dir = args.get("results_dir", "results")
+    _update_experiment_index(results_dir, {
+        "run_id": run_id, "method": "rgtan_ca1", "dataset": "aml", "seed": args["seed"],
+        "auc": final["test_auc"], "ap": final["test_ap"], "f1": final["test_f1"],
+        "best_epoch": final["best_epoch"], "best_val_loss": final["best_val_loss"],
+        "duration_seconds": final["duration_seconds"], "ca1_enabled": True,
+        "ca3_enabled": False, "run_dir": os.path.abspath(run_dir),
+        "created_at": started_at, "status": "success",
+    })
 
 
 def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
@@ -136,12 +157,24 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
     started_at = datetime.now().astimezone().isoformat()
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"rgtan_ca1_aml_seed{args['seed']}_{run_stamp}"
-    run_dir = os.path.join(args.get("results_dir", "results"), run_id)
+    results_dir = args.get("results_dir", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    run_dir = os.path.join(results_dir, run_id)
     os.makedirs(run_dir, exist_ok=False)
     checkpoint_path = os.path.join(run_dir, "best_checkpoint.pt")
     history_path = os.path.join(run_dir, "epoch_history.csv")
     print(f"Experiment run: {run_id}")
     print(f"Artifacts: {os.path.abspath(run_dir)}")
+    resolved = {k: v for k, v in args.items() if not k.startswith("_")}
+    resolved.update({"run_id": run_id, "run_dir": os.path.abspath(run_dir),
+                     "train_mode": "single_split"})
+    with open(os.path.join(run_dir, "config_resolved.yaml"), "w", encoding="utf-8") as handle:
+        yaml.safe_dump(resolved, handle, allow_unicode=True, sort_keys=False)
+    _update_experiment_index(results_dir, {
+        "run_id": run_id, "method": "rgtan_ca1", "dataset": "aml", "seed": args["seed"],
+        "ca1_enabled": True, "ca3_enabled": False, "run_dir": os.path.abspath(run_dir),
+        "created_at": started_at, "status": "running",
+    })
     device = torch.device(args["device"])
     graph = graph.to(device)
     num_feat = torch.from_numpy(feat_df.values).float().to(device)
@@ -275,9 +308,17 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
               f"val_ap={val_metrics['ap']:.4f} val_f1={val_metrics['f1']:.4f}")
         if improved:
             best_loss, stale = val_loss, 0
-            best_state = {"epoch": epoch, "model": copy.deepcopy(model.state_dict()),
-                          "ca1": copy.deepcopy(ca1.state_dict()),
-                          "optimizer": copy.deepcopy(optimizer.state_dict()), "args": dict(args)}
+            best_state = {
+                # Keep legacy keys so existing tooling remains compatible.
+                "epoch": epoch, "model": copy.deepcopy(model.state_dict()),
+                "ca1": copy.deepcopy(ca1.state_dict()),
+                "optimizer": copy.deepcopy(optimizer.state_dict()), "args": dict(args),
+                "rgtan_state_dict": copy.deepcopy(model.state_dict()),
+                "ca1_state_dict": copy.deepcopy(ca1.state_dict()),
+                "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
+                "scheduler_state_dict": copy.deepcopy(scheduler.state_dict()),
+                "best_epoch": epoch + 1, "best_val_metric": val_loss, "config": resolved,
+            }
             torch.save(best_state, checkpoint_path)
         else:
             stale += 1
@@ -288,6 +329,8 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
         raise RuntimeError("No valid CA1 training/validation batch was produced")
     model.load_state_dict(best_state["model"]); ca1.load_state_dict(best_state["ca1"])
     optimizer.load_state_dict(best_state["optimizer"])
+    if "scheduler_state_dict" in best_state:
+        scheduler.load_state_dict(best_state["scheduler_state_dict"])
     model.eval(); ca1.eval()
     def collect_scores(data_loader, description):
         collected_scores, collected_truths = [], []
@@ -301,6 +344,8 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
         return collected_truths, collected_scores
     val_truths, val_scores = collect_scores(val_loader, "best checkpoint val")
     threshold, val_f1 = best_macro_f1_threshold(val_truths, val_scores)
+    val_threshold_metrics = _classification_metrics(
+        val_truths, val_scores, (np.asarray(val_scores) >= threshold).astype(int))
     truths, scores = collect_scores(test_loader, "best checkpoint test")
     preds = (np.asarray(scores) >= threshold).astype(int)
     test_metrics = _classification_metrics(truths, scores, preds)
@@ -308,7 +353,8 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
         "auc": test_metrics["auc"], "f1": test_metrics["f1"], "ap": test_metrics["ap"],
         "precision": float(precision_score(truths, preds, zero_division=0)),
         "recall": float(recall_score(truths, preds, zero_division=0)),
-        "test_threshold": threshold, "val_f1_at_best": val_f1,
+        "test_threshold": threshold, "val_auc_at_best": val_threshold_metrics["auc"],
+        "val_ap_at_best": val_threshold_metrics["ap"], "val_f1_at_best": val_f1,
         "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
         "best_epoch": int(best_state["epoch"]) + 1, "best_val_loss": float(best_loss),
         "duration_seconds": (datetime.now().astimezone()

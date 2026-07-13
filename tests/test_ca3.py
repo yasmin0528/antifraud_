@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import torch
+from sklearn.metrics import f1_score
 
 from methods.modules.ca3 import CA3PrototypeMemory
 from methods.rgtan.evaluation import best_macro_f1_threshold
@@ -40,3 +41,27 @@ def test_validation_threshold_selection():
     threshold, score = best_macro_f1_threshold([0, 0, 1, 1], [0.1, 0.3, 0.6, 0.9])
     assert 0.3 < threshold <= 0.6
     assert np.isclose(score, 1.0)
+
+
+def test_validation_threshold_matches_exhaustive_search_with_ties():
+    rng = np.random.default_rng(2023)
+    for size in (1, 2, 17, 100):
+        labels = rng.integers(0, 2, size=size)
+        scores = rng.choice(np.linspace(0.0, 1.0, 11), size=size)
+        candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
+        expected_threshold, expected_f1 = 0.5, -1.0
+        for candidate in candidates:
+            candidate_f1 = f1_score(
+                labels, scores >= candidate, average="macro", zero_division=0)
+            if candidate_f1 > expected_f1:
+                expected_threshold, expected_f1 = float(candidate), float(candidate_f1)
+        threshold, score = best_macro_f1_threshold(labels, scores)
+        assert threshold == expected_threshold
+        assert np.isclose(score, expected_f1)
+
+
+def test_validation_threshold_rejects_invalid_input():
+    with pytest.raises(ValueError):
+        best_macro_f1_threshold([], [])
+    with pytest.raises(ValueError):
+        best_macro_f1_threshold([0, 1], [0.1, np.nan])
