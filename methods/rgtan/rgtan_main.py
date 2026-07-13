@@ -587,6 +587,8 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         if row["is_best"]:
             best_loss, stale = val_main, 0
             best_state = {
+                "checkpoint_schema_version": 1,
+                "method": "rgtan_ca1_ca3", "dataset": "aml", "seed": args["seed"],
                 "rgtan_state_dict": copy.deepcopy(model.state_dict()),
                 "ca1_state_dict": copy.deepcopy(ca1.state_dict()), "ca3_state_dict": copy.deepcopy(ca3.state_dict()),
                 "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
@@ -635,12 +637,14 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
     final = {
         "run_id": run_id, "method": "rgtan_ca1_ca3", "dataset": "aml", "seed": args["seed"],
         "test_auc": test_metric["auc"], "test_ap": test_metric["ap"], "test_f1": test_metric["f1"],
-        "test_precision": precision_score(test_y, test_preds, zero_division=0),
-        "test_recall": recall_score(test_y, test_preds, zero_division=0), "test_threshold": threshold,
+        "test_precision": float(precision_score(test_y, test_preds, zero_division=0)),
+        "test_recall": float(recall_score(test_y, test_preds, zero_division=0)),
+        "test_threshold": threshold,
         "val_auc_at_best": _classification_metrics(val_eval[1], val_eval[2], np.asarray(val_eval[2]) >= threshold)["auc"],
         "val_ap_at_best": _classification_metrics(val_eval[1], val_eval[2], np.asarray(val_eval[2]) >= threshold)["ap"],
         "val_f1_at_best": val_f1, "best_epoch": best_state["best_epoch"], "best_val_loss": best_loss,
         "duration_seconds": (datetime.now().astimezone() - started_dt).total_seconds(),
+        "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
         "ca1_enabled": True, "ca3_enabled": True, "ca3_num_prototypes": args["ca3_num_prototypes"],
         "ca3_warmup_epochs": warmup, "ca3_temperature": args["ca3_temperature"],
         "ca3_aux_weight": args["ca3_aux_weight"], "ca3_diversity_weight": args["ca3_diversity_weight"],
@@ -685,9 +689,14 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         "ca3_num_prototypes": args["ca3_num_prototypes"],
         "ca3_init_method": args["ca3_init_method"], "ca3_init_epoch": warmup,
     }, os.path.join(run_dir, "prototype_bank.pt"))
-    metadata = {**index_base, "base_method": "rgtan", "train_mode": "single_split",
+    metadata = {**index_base, **final, "base_method": "rgtan", "train_mode": "single_split",
                 "split_mode": args["split_mode"], "ca3_initialized": True, "ca3_init_epoch": warmup,
                 "ca3_init_data": "train_positive_only", "ca3_use_group_id": False,
+                "split_seed": args["seed"], "validation_split_seed": args["seed"] + 1,
+                "ca3_kmeans_random_state": args["seed"],
+                "reproducibility": args.get("reproducibility", {}),
+                "ca1_cache_fingerprint": cache["source_fingerprint"],
+                "resolved_config_file": "config_resolved.yaml",
                 "alert_id_used_in_forward": False, "label_derived_neighbor_features": False,
                 "label_propagation_scope": "train_only",
                 "amount_normalization_scope": "train_split",

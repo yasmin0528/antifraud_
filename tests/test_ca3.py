@@ -37,6 +37,17 @@ def test_ca3_initialization_shape_is_strict():
         module.initialize_prototypes(torch.randn(3, 8))
 
 
+def test_ca3_initialization_state_survives_checkpoint_round_trip():
+    source = CA3PrototypeMemory(embedding_dim=8, num_prototypes=4)
+    source.initialize_prototypes(torch.randn(4, 8))
+    checkpoint = {"ca3_state_dict": source.state_dict(), "ca3_initialized": True}
+    restored = CA3PrototypeMemory(embedding_dim=8, num_prototypes=4)
+    restored.load_state_dict(checkpoint["ca3_state_dict"])
+    assert bool(restored.initialized.item()) is True
+    assert torch.equal(restored.prototypes, source.prototypes)
+    assert torch.equal(restored.init_prototypes, source.init_prototypes)
+
+
 def test_validation_threshold_selection():
     threshold, score = best_macro_f1_threshold([0, 0, 1, 1], [0.1, 0.3, 0.6, 0.9])
     assert 0.3 < threshold <= 0.6

@@ -11,6 +11,7 @@ import pickle
 import dgl
 from scipy.io import loadmat
 import yaml
+from reproducibility import seed_everything
 
 logger = logging.getLogger(__name__)
 # sys.path.append("..")
@@ -90,6 +91,8 @@ def base_load_data(args: dict):
 
 
 def main(args):
+    if "seed" in args:
+        args["reproducibility"] = seed_everything(args["seed"])
     if args['method'] == 'mcnn':
         from methods.mcnn.mcnn_main import mcnn_main
         base_load_data(args)
