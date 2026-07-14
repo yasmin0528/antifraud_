@@ -218,8 +218,8 @@ def test_ca3_entropy_gating():
 
     module.eval()
     with torch.no_grad():
-        # 将 close 和 far 连在一起一次性 forward
-        combined = torch.cat([close, far], dim=0).repeat(10, 1)
+        # 将 close×10 和 far×10 堆叠在一起一次性 forward
+        combined = torch.cat([close.repeat(10, 1), far.repeat(10, 1)], dim=0)
         output = module(combined, enabled=True)
 
     low_entropy_gate = output.gate_probs[:10].mean().item()

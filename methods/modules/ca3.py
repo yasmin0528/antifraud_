@@ -56,8 +56,7 @@ class CA3PrototypeMemory(nn.Module):
         self.register_buffer("_anneal_progress", torch.tensor(0.0))
         self.register_buffer("_gate_bias_init", torch.tensor(float(gate_bias_init)))
         self.register_buffer("_gate_bias_final", torch.tensor(float(gate_bias_final)))
-        if gate_bias_init != 0.0:
-            nn.init.constant_(self.gate_mlp.bias, gate_bias_init)
+        nn.init.constant_(self.gate_mlp.bias, gate_bias_init)
 
         # A1: 死原型跟踪
         self.register_buffer("_usage_this_epoch",
@@ -77,7 +76,7 @@ class CA3PrototypeMemory(nn.Module):
     @torch.no_grad()
     def set_anneal_progress(self, progress: float) -> None:
         """线性插值 gate_mlp.bias 从 _gate_bias_init 到 _gate_bias_final。"""
-        p = float(progress)
+        p = max(0.0, min(1.0, float(progress)))
         bias = (self._gate_bias_init.item()
                 + p * (self._gate_bias_final.item() - self._gate_bias_init.item()))
         self.gate_mlp.bias.fill_(bias)
@@ -87,11 +86,12 @@ class CA3PrototypeMemory(nn.Module):
     @torch.no_grad()
     def on_epoch_end(self) -> None:
         """epoch 结束时更新死亡计数并重置使用统计。"""
-        dead = (self._usage_this_epoch == 0)
-        self._dead_epoch_count = torch.where(
-            dead,
-            self._dead_epoch_count + 1,
-            torch.zeros_like(self._dead_epoch_count))
+        if self.training:
+            dead = (self._usage_this_epoch == 0)
+            self._dead_epoch_count = torch.where(
+                dead,
+                self._dead_epoch_count + 1,
+                torch.zeros_like(self._dead_epoch_count))
         self._usage_this_epoch.zero_()
 
     @torch.no_grad()
