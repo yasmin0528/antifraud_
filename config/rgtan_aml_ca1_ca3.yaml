@@ -40,6 +40,7 @@ ca3_top_k: 3
 ca3_aux_weight: 0.05
 ca3_diversity_weight: 0.001
 ca3_fusion: gated_residual
+ca3_gate_bias_init: -2.0
 
 results_dir: results
 nei_att_heads:

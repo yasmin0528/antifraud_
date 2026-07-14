@@ -454,7 +454,8 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
                      args["ca1_encoder_type"], args["ca1_pooling"]).to(device)
     ca3 = CA3PrototypeMemory(
         args["ca1_hidden_dim"], args["ca3_num_prototypes"], args["ca3_temperature"],
-        args["ca3_top_k"], args["ca3_fusion"]).to(device)
+        args["ca3_top_k"], args["ca3_fusion"],
+        gate_bias_init=args.get("ca3_gate_bias_init", 0.0)).to(device)
     optimizer = optim.Adam(
         list(model.parameters()) + list(ca1.parameters()) + list(ca3.parameters()),
         lr=args["lr"] * np.sqrt(args["batch_size"] / 1024), weight_decay=args["wd"])

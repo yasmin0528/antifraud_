@@ -22,7 +22,7 @@ class CA3PrototypeMemory(nn.Module):
     """Deployable risk-pattern memory; no labels or group IDs enter forward()."""
 
     def __init__(self, embedding_dim=64, num_prototypes=16, temperature=0.2,
-                 top_k=3, fusion="gated_residual"):
+                 top_k=3, fusion="gated_residual", gate_bias_init=0.0):
         super().__init__()
         if num_prototypes < 1:
             raise ValueError("num_prototypes must be positive")
@@ -40,6 +40,8 @@ class CA3PrototypeMemory(nn.Module):
         self.gate_mlp = nn.Linear(embedding_dim * 2, 1)
         self.risk_head = nn.Linear(3, 1)
         self.layer_norm = nn.LayerNorm(embedding_dim)
+        if gate_bias_init != 0.0:
+            nn.init.constant_(self.gate_mlp.bias, gate_bias_init)
         nn.init.eye_(self.query_proj.weight)
         nn.init.zeros_(self.query_proj.bias)
         nn.init.eye_(self.memory_proj.weight)

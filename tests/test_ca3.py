@@ -76,3 +76,17 @@ def test_validation_threshold_rejects_invalid_input():
         best_macro_f1_threshold([], [])
     with pytest.raises(ValueError):
         best_macro_f1_threshold([0, 1], [0.1, np.nan])
+
+
+def test_ca3_gate_bias_init():
+    """Negative gate_bias_init pushes initial gate values toward 0."""
+    zero_bias = CA3PrototypeMemory(embedding_dim=8, num_prototypes=4, gate_bias_init=0.0)
+    neg_bias = CA3PrototypeMemory(embedding_dim=8, num_prototypes=4, gate_bias_init=-2.0)
+    assert zero_bias.gate_mlp.bias.item() == 0.0
+    assert neg_bias.gate_mlp.bias.item() == -2.0
+    # Also test that bias -2.0 produces gate ≈ sigmoid(-2) ≈ 0.12
+    neg_bias.initialize_prototypes(torch.randn(4, 8))
+    embedding = torch.randn(10, 8)
+    output = neg_bias(embedding, enabled=True)
+    avg_gate = output.gate.mean().item()
+    assert 0.08 < avg_gate < 0.20, f"Expected gate ≈0.12, got {avg_gate}"
