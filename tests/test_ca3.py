@@ -208,18 +208,19 @@ def test_ca3_entropy_gating():
     """验证高熵（模糊分配）样本的 gate 值更低。"""
     module = CA3PrototypeMemory(
         embedding_dim=8, num_prototypes=4,
-        entropy_gate_beta=2.0)  # 放大效果以便检测
+        temperature=1.0,              # 温和温度 → 接近原型均值时分配更均匀
+        gate_bias_init=2.0,           # 正向 baseline gate
+        entropy_gate_beta=5.0)        # 适中的熵惩罚
     module.initialize_prototypes(torch.randn(4, 8))
-
-    # 低熵：embedding 接近某个原型
-    close = module.prototypes[0:1] + torch.randn(1, 8) * 0.01
-    # 高熵：embedding 远离所有原型
-    far = torch.randn(1, 8) * 10
-
     module.eval()
+
+    # 低熵：与原型 0 精确匹配 → 相似度 [1, ~0, ~0, ~0] → 低熵
+    close = module.prototypes[0:1].repeat(10, 1)
+    # 高熵：prototypes 的均值（L2 归一化后对各原型相似度几乎相等）→ 接近最高熵
+    far_avg = F.normalize(module.prototypes.mean(dim=0, keepdim=True), dim=-1).repeat(10, 1)
+
     with torch.no_grad():
-        # 将 close×10 和 far×10 堆叠在一起一次性 forward
-        combined = torch.cat([close.repeat(10, 1), far.repeat(10, 1)], dim=0)
+        combined = torch.cat([close, far_avg], dim=0)
         output = module(combined, enabled=True)
 
     low_entropy_gate = output.gate_probs[:10].mean().item()
