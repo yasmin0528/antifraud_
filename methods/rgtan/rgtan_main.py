@@ -26,7 +26,7 @@ from tqdm import tqdm
 from . import *
 from .rgtan_lpa import load_lpa_subtensor
 from .rgtan_model import RGTAN
-from .evaluation import best_binary_f1_threshold
+from .evaluation import best_macro_f1_threshold
 from feature_engineering.data_process import preprocess_aml_for_gtan
 from feature_engineering.ca1_cache import load_or_build_aml_ca1_cache
 from methods.modules.ca1 import CA1Encoder
@@ -95,14 +95,11 @@ def _seed_local_indices(input_nodes, seeds):
 
 def _classification_metrics(truths, scores, preds):
     if not truths:
-        return {"auc": float("nan"), "ap": float("nan"), "f1": float("nan"),
-                "macro_f1": float("nan")}
+        return {"auc": float("nan"), "ap": float("nan"), "f1": float("nan")}
     truths = np.asarray(truths)
-    preds = np.asarray(preds)
     result = {
         "ap": float(average_precision_score(truths, scores)),
-        "f1": float(f1_score(truths, preds, average="binary", pos_label=1, zero_division=0)),
-        "macro_f1": float(f1_score(truths, preds, average="macro", zero_division=0)),
+        "f1": float(f1_score(truths, preds, average="macro")),
     }
     result["auc"] = (float(roc_auc_score(truths, scores))
                      if np.unique(truths).size > 1 else float("nan"))
@@ -113,13 +110,11 @@ def _save_ca1_results(args, metrics, cache, run_dir, run_id, started_at):
     final = {
         "run_id": run_id, "method": "rgtan_ca1", "dataset": "aml", "seed": args["seed"],
         "test_auc": metrics["auc"], "test_ap": metrics["ap"], "test_f1": metrics["f1"],
-        "test_macro_f1": metrics["macro_f1"],
         "test_precision": metrics["precision"], "test_recall": metrics["recall"],
         "test_threshold": metrics["test_threshold"],
         "val_auc_at_best": metrics["val_auc_at_best"],
         "val_ap_at_best": metrics["val_ap_at_best"],
         "val_f1_at_best": metrics["val_f1_at_best"],
-        "val_macro_f1_at_best": metrics["val_macro_f1_at_best"],
         "best_epoch": metrics["best_epoch"], "best_val_loss": metrics["best_val_loss"],
         "duration_seconds": metrics["duration_seconds"],
         "train_size": metrics["train_size"], "val_size": metrics["val_size"],
@@ -348,7 +343,7 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
                 collected_truths.extend(batch_labels[valid].cpu().tolist())
         return collected_truths, collected_scores
     val_truths, val_scores = collect_scores(val_loader, "best checkpoint val")
-    threshold, val_f1 = best_binary_f1_threshold(val_truths, val_scores)
+    threshold, val_f1 = best_macro_f1_threshold(val_truths, val_scores)
     val_threshold_metrics = _classification_metrics(
         val_truths, val_scores, (np.asarray(val_scores) >= threshold).astype(int))
     truths, scores = collect_scores(test_loader, "best checkpoint test")
@@ -356,12 +351,10 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
     test_metrics = _classification_metrics(truths, scores, preds)
     metrics = {
         "auc": test_metrics["auc"], "f1": test_metrics["f1"], "ap": test_metrics["ap"],
-        "macro_f1": test_metrics["macro_f1"],
         "precision": float(precision_score(truths, preds, zero_division=0)),
         "recall": float(recall_score(truths, preds, zero_division=0)),
         "test_threshold": threshold, "val_auc_at_best": val_threshold_metrics["auc"],
         "val_ap_at_best": val_threshold_metrics["ap"], "val_f1_at_best": val_f1,
-        "val_macro_f1_at_best": val_threshold_metrics["macro_f1"],
         "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
         "best_epoch": int(best_state["epoch"]) + 1, "best_val_loss": float(best_loss),
         "duration_seconds": (datetime.now().astimezone()
@@ -617,7 +610,7 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
     scheduler.load_state_dict(best_state["scheduler_state_dict"])
     ca3_enabled = True
     val_eval = evaluate(val_loader, "best checkpoint val")
-    threshold, val_f1 = best_binary_f1_threshold(val_eval[1], val_eval[2])
+    threshold, val_f1 = best_macro_f1_threshold(val_eval[1], val_eval[2])
 
     model.eval(); ca1.eval(); ca3.eval(); assignments = []
     test_y, test_scores = [], []
@@ -644,16 +637,12 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
     final = {
         "run_id": run_id, "method": "rgtan_ca1_ca3", "dataset": "aml", "seed": args["seed"],
         "test_auc": test_metric["auc"], "test_ap": test_metric["ap"], "test_f1": test_metric["f1"],
-        "test_macro_f1": test_metric["macro_f1"],
         "test_precision": float(precision_score(test_y, test_preds, zero_division=0)),
         "test_recall": float(recall_score(test_y, test_preds, zero_division=0)),
         "test_threshold": threshold,
         "val_auc_at_best": _classification_metrics(val_eval[1], val_eval[2], np.asarray(val_eval[2]) >= threshold)["auc"],
         "val_ap_at_best": _classification_metrics(val_eval[1], val_eval[2], np.asarray(val_eval[2]) >= threshold)["ap"],
-        "val_f1_at_best": val_f1,
-        "val_macro_f1_at_best": _classification_metrics(
-            val_eval[1], val_eval[2], np.asarray(val_eval[2]) >= threshold)["macro_f1"],
-        "best_epoch": best_state["best_epoch"], "best_val_loss": best_loss,
+        "val_f1_at_best": val_f1, "best_epoch": best_state["best_epoch"], "best_val_loss": best_loss,
         "duration_seconds": (datetime.now().astimezone() - started_dt).total_seconds(),
         "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
         "ca1_enabled": True, "ca3_enabled": True, "ca3_num_prototypes": args["ca3_num_prototypes"],
@@ -876,7 +865,7 @@ def _rgtan_aml_single_main_impl(feat_df, graph, train_idx, val_idx, test_idx, la
     optimizer.load_state_dict(best_state["optimizer_state_dict"])
     scheduler.load_state_dict(best_state["scheduler_state_dict"])
     val_eval = evaluate(val_loader, "best checkpoint val")
-    threshold, val_f1 = best_binary_f1_threshold(val_eval[1], val_eval[2])
+    threshold, val_f1 = best_macro_f1_threshold(val_eval[1], val_eval[2])
     test_eval = evaluate(test_loader, "best checkpoint test")
     test_preds = (np.asarray(test_eval[2]) >= threshold).astype(int)
     test_metrics = _classification_metrics(test_eval[1], test_eval[2], test_preds)
@@ -885,12 +874,10 @@ def _rgtan_aml_single_main_impl(feat_df, graph, train_idx, val_idx, test_idx, la
     final = {
         "run_id": run_id, "method": "rgtan", "dataset": "aml", "seed": args["seed"],
         "test_auc": test_metrics["auc"], "test_ap": test_metrics["ap"], "test_f1": test_metrics["f1"],
-        "test_macro_f1": test_metrics["macro_f1"],
         "test_precision": precision_score(test_eval[1], test_preds, zero_division=0),
         "test_recall": recall_score(test_eval[1], test_preds, zero_division=0),
         "test_threshold": threshold, "val_auc_at_best": val_threshold_metrics["auc"],
         "val_ap_at_best": val_threshold_metrics["ap"], "val_f1_at_best": val_f1,
-        "val_macro_f1_at_best": val_threshold_metrics["macro_f1"],
         "best_epoch": best_state["best_epoch"], "best_val_loss": best_loss,
         "duration_seconds": (datetime.now().astimezone() - started_dt).total_seconds(),
         "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
@@ -1161,7 +1148,7 @@ def rgtan_main(feat_df, graph, train_idx, test_idx, labels, args, cat_features, 
     test_score1 = test_score1[mask]
 
     print("test AUC:", roc_auc_score(y_target, test_score))
-    print("test f1:", f1_score(y_target, test_score1, average="binary", pos_label=1, zero_division=0))
+    print("test f1:", f1_score(y_target, test_score1, average="macro"))
     print("test AP:", average_precision_score(y_target, test_score))
 
 
