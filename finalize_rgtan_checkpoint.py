@@ -1,7 +1,7 @@
 """Finalize an interrupted AML RGTAN run from its best checkpoint.
 
 The script rebuilds the deterministic sender-account split, selects the
-macro-F1 threshold on validation scores, evaluates test exactly once, and
+positive-class F1 threshold on validation scores, evaluates test exactly once, and
 writes the missing standard run artifacts into the original run directory.
 """
 
@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from feature_engineering.ca1_cache import load_or_build_aml_ca1_cache
 from methods.modules.ca1 import CA1Encoder
-from methods.rgtan.evaluation import best_macro_f1_threshold
+from methods.rgtan.evaluation import best_binary_f1_threshold
 from methods.rgtan.rgtan_lpa import load_lpa_subtensor
 from methods.rgtan.rgtan_main import (
     _classification_metrics,
@@ -258,7 +258,7 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
 
         # Validation is always evaluated before test and is the only source of the threshold.
         val_y, val_scores = collect(val_loader, "checkpoint validation")
-        threshold, val_f1 = best_macro_f1_threshold(val_y, val_scores)
+        threshold, val_f1 = best_binary_f1_threshold(val_y, val_scores)
         val_preds = (np.asarray(val_scores) >= threshold).astype(int)
         val_metrics = _classification_metrics(val_y, val_scores, val_preds)
 
@@ -273,10 +273,12 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             "run_id": run_id, "method": method, "dataset": "aml", "seed": args["seed"],
             "test_auc": test_metrics["auc"], "test_ap": test_metrics["ap"],
             "test_f1": test_metrics["f1"],
+            "test_macro_f1": test_metrics["macro_f1"],
             "test_precision": float(precision_score(test_y, test_preds, zero_division=0)),
             "test_recall": float(recall_score(test_y, test_preds, zero_division=0)),
             "test_threshold": threshold, "val_auc_at_best": val_metrics["auc"],
             "val_ap_at_best": val_metrics["ap"], "val_f1_at_best": val_f1,
+            "val_macro_f1_at_best": val_metrics["macro_f1"],
             "best_epoch": best_epoch, "best_val_loss": best_val_loss,
             "duration_seconds": training_seconds + finalization_seconds,
             "finalization_seconds": finalization_seconds,
