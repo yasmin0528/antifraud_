@@ -455,7 +455,14 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
     ca3 = CA3PrototypeMemory(
         args["ca1_hidden_dim"], args["ca3_num_prototypes"], args["ca3_temperature"],
         args["ca3_top_k"], args["ca3_fusion"],
-        gate_bias_init=args.get("ca3_gate_bias_init", 0.0)).to(device)
+        gate_bias_init=args.get("ca3_gate_bias_init", -2.0),
+        gate_bias_final=args.get("ca3_gate_bias_final", -1.0),
+        anneal_epochs=args.get("ca3_anneal_epochs", 10),
+        dead_epoch_threshold=args.get("ca3_dead_threshold", 3),
+        entropy_gate_beta=args.get("ca3_entropy_gate_beta", 1.0),
+        contrastive_temperature=args.get("ca3_contrastive_temperature", 0.1),
+        diversity_margin=args.get("ca3_diversity_margin", 0.5),
+    ).to(device)
     optimizer = optim.Adam(
         list(model.parameters()) + list(ca1.parameters()) + list(ca3.parameters()),
         lr=args["lr"] * np.sqrt(args["batch_size"] / 1024), weight_decay=args["wd"])
@@ -477,6 +484,19 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         kmeans.fit(matrix)
         ca3.initialize_prototypes(kmeans.cluster_centers_)
 
+    # A1: 正样本 embedding 池，供死原型刷新使用
+    positive_emb_pool = None
+
+    def build_positive_embedding_pool():
+        model.eval(); ca1.eval(); emb_list = []
+        with torch.no_grad():
+            for start in range(0, len(positive_train), args["batch_size"]):
+                nodes = torch.as_tensor(positive_train[start:start + args["batch_size"]], dtype=torch.long)
+                emb, _, _ = ca1(ca1_sequence[nodes].to(device), ca1_len[nodes].to(device),
+                                ca1_mask[nodes].to(device))
+                emb_list.append(emb.cpu())
+        return torch.cat(emb_list)
+
     def forward_batch(input_nodes, seeds, blocks, ca3_enabled):
         inputs, work_inputs, neigh_inputs, batch_labels, lpa_labels = load_lpa_subtensor(
             num_feat, cat_feat, nei_feat, {}, label_tensor, seeds, input_nodes, device, blocks,
@@ -488,23 +508,31 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         local = _seed_local_indices(input_nodes, seeds)
         logits = model([block.to(device) for block in blocks], inputs, lpa_labels,
                        work_inputs, neigh_inputs, ca1_embedding=ca3_out.enhanced_embedding)
-        return logits, ca1_logit[local], ca1_score[local], ca3_out, local, batch_labels
+        return logits, ca1_logit[local], ca1_score[local], ca3_out, local, batch_labels, ca1_embedding
 
     if warmup == 0:
         initialize_ca3()
+        positive_emb_pool = build_positive_embedding_pool()
     best_loss, best_state, stale = float("inf"), None, 0
     history_path = os.path.join(run_dir, "epoch_history.csv")
     checkpoint_path = os.path.join(run_dir, "best_checkpoint.pt")
     for epoch in tqdm(range(args["max_epochs"]), desc="epochs", unit="epoch"):
         ca3_enabled = bool(ca3.initialized.item())
         epoch_started = time.perf_counter()
+
+        # C2: 融合退火进度
+        if ca3_enabled:
+            anneal_epochs = args.get("ca3_anneal_epochs", 10)
+            anneal_progress = max(0.0, min(1.0, (epoch - warmup) / anneal_epochs))
+            ca3.set_anneal_progress(anneal_progress)
+
         model.train(); ca1.train(); ca3.train()
-        accum = {key: [] for key in ("main", "ca1", "ca3", "div", "total")}
-        train_y, train_score, train_pred, train_proto = [], [], [], []
+        accum = {key: [] for key in ("main", "ca1", "contrastive", "div", "total")}
+        train_y, train_score, train_pred = [], [], []
         train_entropy, train_ids, train_gates = [], [], []
         for input_nodes, seeds, blocks in tqdm(train_loader, desc=f"epoch {epoch + 1:02d} train",
                                                leave=False, unit="batch"):
-            logits, ca1_logit, _, ca3_out, local, batch_labels = forward_batch(
+            logits, ca1_logit, _, ca3_out, local, batch_labels, ca1_emb = forward_batch(
                 input_nodes, seeds, blocks, ca3_enabled)
             valid = batch_labels != 2
             if not valid.any():
@@ -512,56 +540,53 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
             main_loss = main_loss_fn(logits[valid], batch_labels[valid])
             ca1_loss = binary_loss_fn(ca1_logit[valid].squeeze(-1), batch_labels[valid].float())
             if ca3_enabled:
-                ca3_loss = binary_loss_fn(ca3_out.proto_risk_logit[local][valid].squeeze(-1),
-                                          batch_labels[valid].float())
+                contrastive = ca3.contrastive_loss(ca1_emb)
                 diversity = ca3.diversity_loss()
             else:
-                ca3_loss = main_loss.new_zeros(()); diversity = main_loss.new_zeros(())
+                contrastive = main_loss.new_zeros(()); diversity = main_loss.new_zeros(())
             total = (main_loss + args["ca1_aux_weight"] * ca1_loss
-                     + args["ca3_aux_weight"] * ca3_loss
-                     + args["ca3_diversity_weight"] * diversity)
+                     + args.get("ca3_contrastive_weight", 0.1) * contrastive
+                     + args.get("ca3_diversity_weight", 0.001) * diversity)
             optimizer.zero_grad(); total.backward(); optimizer.step(); scheduler.step()
-            for key, value in zip(accum, (main_loss, ca1_loss, ca3_loss, diversity, total)):
+            for key, value in zip(accum, (main_loss, ca1_loss, contrastive, diversity, total)):
                 accum[key].append(value.item())
             probs = torch.softmax(logits[valid].detach(), dim=1)[:, 1]
             train_y += batch_labels[valid].cpu().tolist(); train_score += probs.cpu().tolist()
             train_pred += (probs >= 0.5).long().cpu().tolist()
             if ca3_enabled:
-                train_proto += ca3_out.proto_score[local][valid].detach().squeeze(-1).cpu().tolist()
                 train_entropy += ca3_out.assignment_entropy[local][valid].detach().cpu().tolist()
                 train_ids += ca3_out.top_proto_id[local][valid].detach().cpu().tolist()
-                train_gates += ca3_out.gate[local][valid].detach().squeeze(-1).cpu().tolist()
+                train_gates += ca3_out.gate_probs[local][valid].detach().squeeze(-1).cpu().tolist()
 
         def evaluate(loader, description):
-            model.eval(); ca1.eval(); ca3.eval(); result = {key: [] for key in ("main", "ca1", "ca3", "div", "total")}
-            ys, scores, preds, proto_scores, entropies, proto_ids, gates = [], [], [], [], [], [], []
+            model.eval(); ca1.eval(); ca3.eval(); result = {key: [] for key in ("main", "ca1", "contrastive", "div", "total")}
+            ys, scores, preds, entropies, proto_ids, gates = [], [], [], [], [], []
             with torch.no_grad():
                 for input_nodes, seeds, blocks in tqdm(loader, desc=description, leave=False, unit="batch"):
-                    logits, ca1_logit, _, out, local, batch_labels = forward_batch(input_nodes, seeds, blocks, ca3_enabled)
+                    logits, ca1_logit, _, out, local, batch_labels, ca1_emb = forward_batch(
+                        input_nodes, seeds, blocks, ca3_enabled)
                     valid = batch_labels != 2
                     if not valid.any(): continue
                     ml = main_loss_fn(logits[valid], batch_labels[valid])
                     c1 = binary_loss_fn(ca1_logit[valid].squeeze(-1), batch_labels[valid].float())
-                    c3 = (binary_loss_fn(out.proto_risk_logit[local][valid].squeeze(-1), batch_labels[valid].float())
-                          if ca3_enabled else ml.new_zeros(()))
+                    contrastive = (ca3.contrastive_loss(ca1_emb) if ca3_enabled else ml.new_zeros(()))
                     div = ca3.diversity_loss() if ca3_enabled else ml.new_zeros(())
-                    total = ml + args["ca1_aux_weight"] * c1 + args["ca3_aux_weight"] * c3 + args["ca3_diversity_weight"] * div
-                    for key, value in zip(result, (ml, c1, c3, div, total)): result[key].append(value.item())
+                    total = (ml + args["ca1_aux_weight"] * c1
+                             + args.get("ca3_contrastive_weight", 0.1) * contrastive
+                             + args.get("ca3_diversity_weight", 0.001) * div)
+                    for key, value in zip(result, (ml, c1, contrastive, div, total)): result[key].append(value.item())
                     prob = torch.softmax(logits[valid], dim=1)[:, 1]
                     ys += batch_labels[valid].cpu().tolist(); scores += prob.cpu().tolist(); preds += (prob >= 0.5).long().cpu().tolist()
                     if ca3_enabled:
-                        proto_scores += out.proto_score[local][valid].squeeze(-1).cpu().tolist()
                         entropies += out.assignment_entropy[local][valid].cpu().tolist()
                         proto_ids += out.top_proto_id[local][valid].cpu().tolist()
-                        gates += out.gate[local][valid].squeeze(-1).cpu().tolist()
-            return result, ys, scores, preds, proto_scores, entropies, proto_ids, gates
+                        gates += out.gate_probs[local][valid].squeeze(-1).cpu().tolist()
+            return result, ys, scores, preds, entropies, proto_ids, gates
 
-        val_losses, val_y, val_scores, val_preds, val_proto, val_entropy, val_ids, val_gates = evaluate(
+        val_losses, val_y, val_scores, val_preds, val_entropy, val_ids, val_gates = evaluate(
             val_loader, f"epoch {epoch + 1:02d} val")
         train_metrics = _classification_metrics(train_y, train_score, train_pred)
         val_metrics = _classification_metrics(val_y, val_scores, val_preds)
-        train_proto_metrics = _classification_metrics(train_y, train_proto, [s >= .5 for s in train_proto]) if ca3_enabled else {"auc": np.nan, "ap": np.nan, "f1": np.nan}
-        val_proto_metrics = _classification_metrics(val_y, val_proto, [s >= .5 for s in val_proto]) if ca3_enabled else {"auc": np.nan, "ap": np.nan, "f1": np.nan}
         val_main = float(np.mean(val_losses["main"]))
         row = {
             "run_id": run_id, "timestamp": datetime.now().astimezone().isoformat(), "epoch": epoch + 1,
@@ -571,8 +596,6 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         for prefix, values in (("train", accum), ("val", val_losses)):
             for name, values_list in values.items(): row[f"{prefix}_{name}_loss"] = float(np.mean(values_list))
         for prefix, values in (("train", train_metrics), ("val", val_metrics)):
-            for name, value in values.items(): row[f"{prefix}_{name}"] = value
-        for prefix, values in (("train_proto_score", train_proto_metrics), ("val_proto_score", val_proto_metrics)):
             for name, value in values.items(): row[f"{prefix}_{name}"] = value
         row.update({
             "train_assignment_entropy": float(np.mean(train_entropy)) if train_entropy else np.nan,
@@ -601,8 +624,17 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         elif ca3_enabled:
             stale += 1
             if stale >= args["early_stopping"]: break
+        # A1: epoch 结束时执行死原型检查与刷新
+        if ca3_enabled:
+            ca3.on_epoch_end()
+            n_refreshed = ca3.refresh_dead_prototypes(positive_emb_pool.to(ca3.prototypes.device))
+            if n_refreshed > 0:
+                logger.info(f"Refreshed {n_refreshed} dead prototypes at epoch {epoch + 1}")
+
         if not ca3_enabled and epoch + 1 == warmup:
-            initialize_ca3(); best_loss, stale = float("inf"), 0
+            initialize_ca3()
+            positive_emb_pool = build_positive_embedding_pool().to(device)
+            best_loss, stale = float("inf"), 0
 
     if best_state is None or not best_state["ca3_initialized"]:
         raise RuntimeError("No initialized CA3 checkpoint was selected")
@@ -617,7 +649,7 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
     test_y, test_scores = [], []
     with torch.no_grad():
         for input_nodes, seeds, blocks in tqdm(test_loader, desc="best checkpoint test", leave=False, unit="batch"):
-            logits, _, ca1_score, out, local, batch_labels = forward_batch(input_nodes, seeds, blocks, True)
+            logits, _, ca1_score, out, local, batch_labels, _ = forward_batch(input_nodes, seeds, blocks, True)
             valid = batch_labels != 2; seed_ids = seeds[valid].detach().cpu().tolist()
             score = torch.softmax(logits[valid], dim=1)[:, 1]
             test_y += batch_labels[valid].cpu().tolist(); test_scores += score.cpu().tolist()
@@ -626,12 +658,10 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
                     "TX_ID": args["_aml_sample_ids"][node_id], "label": int(batch_labels[valid][j].item()),
                     "rgtan_logit": float(logits[valid][j, 1].item()), "rgtan_score": float(score[j].item()),
                     "ca1_score_micro": float(ca1_score[valid][j].item()),
-                    "ca3_proto_risk_logit": float(out.proto_risk_logit[local][valid][j].item()),
-                    "ca3_proto_score": float(out.proto_score[local][valid][j].item()),
                     "top_proto_id": int(out.top_proto_id[local][valid][j].item()),
                     "top_proto_sim": float(out.top_proto_sim[local][valid][j].item()),
                     "assignment_entropy": float(out.assignment_entropy[local][valid][j].item()),
-                    "gate": float(out.gate[local][valid][j].item()), "node_id": node_id,
+                    "gate": float(out.gate_probs[local][valid][j].item()), "node_id": node_id,
                 })
     test_preds = (np.asarray(test_scores) >= threshold).astype(int)
     test_metric = _classification_metrics(test_y, test_scores, test_preds)
@@ -648,7 +678,7 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
         "ca1_enabled": True, "ca3_enabled": True, "ca3_num_prototypes": args["ca3_num_prototypes"],
         "ca3_warmup_epochs": warmup, "ca3_temperature": args["ca3_temperature"],
-        "ca3_aux_weight": args["ca3_aux_weight"], "ca3_diversity_weight": args["ca3_diversity_weight"],
+        "ca3_contrastive_weight": args.get("ca3_contrastive_weight", 0.1), "ca3_diversity_weight": args.get("ca3_diversity_weight", 0.001),
     }
     pd.DataFrame([final]).to_csv(os.path.join(run_dir, "final_metrics.csv"), index=False)
     assignment_df = pd.DataFrame(assignments)
@@ -666,7 +696,6 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
             "positive_rate": float(group["label"].mean()) if len(group) else np.nan,
             "avg_similarity": float(group["top_proto_sim"].mean()) if len(group) else np.nan,
             "avg_gate": float(group["gate"].mean()) if len(group) else np.nan,
-            "avg_proto_score": float(group["ca3_proto_score"].mean()) if len(group) else np.nan,
             "unique_alert_id_count": int(group["AlertID"].nunique()),
             "top_alert_id": alert_counts.index[0] if len(alert_counts) else None,
             "top_alert_id_count": int(alert_counts.iloc[0]) if len(alert_counts) else 0,

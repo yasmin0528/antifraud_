@@ -37,10 +37,17 @@ ca3_use_ema: false
 ca3_use_group_id: false
 ca3_temperature: 0.2
 ca3_top_k: 3
-ca3_aux_weight: 0.05
+# ca3_aux_weight: 0.05           # 已被 ca3_contrastive_weight 替代
 ca3_diversity_weight: 0.001
+ca3_diversity_margin: 0.5         # 低于此 margin 的原型对不受 diversity 惩罚
 ca3_fusion: gated_residual
 ca3_gate_bias_init: -2.0
+ca3_gate_bias_final: -1.0         # 退火目标 bias，-1 ≈ gate=0.27
+ca3_anneal_epochs: 10             # 退火持续 epoch 数
+ca3_dead_threshold: 3             # 连续 N epoch 未使用即判死
+ca3_contrastive_weight: 0.1       # 对比原型学习权重
+ca3_contrastive_temperature: 0.1  # InfoNCE 温度
+ca3_entropy_gate_beta: 1.0        # 置信度门控系数（0=关闭）
 
 results_dir: results
 nei_att_heads:
