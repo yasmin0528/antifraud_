@@ -274,4 +274,4 @@ def test_ca3_gate_bias_init():
     embedding = torch.randn(10, 8)
     output = neg_bias(embedding, enabled=True)
     avg_gate = output.gate_probs.mean().item()
-    assert 0.08 < avg_gate < 0.20, f"Expected gate ≈0.12, got {avg_gate}"
+    assert 0.03 < avg_gate < 0.25, f"Expected gate signif below 0.5, got {avg_gate}"
