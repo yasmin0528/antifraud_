@@ -130,7 +130,11 @@ class RuleEngine:
         # on newer GPU architectures (Ada Lovelace / Hopper) under PyTorch 1.12.
         batch = {k: v.cpu() for k, v in batch.items()} if _cpu else batch
         n = self._batch_size(batch)
-        hit_mat = torch.ones(n, len(self._rules), dtype=torch.bool)
+        hit_device = next(iter(batch.values())).device if batch else self.device
+        hit_mat = torch.ones(n, len(self._rules), dtype=torch.bool, device=hit_device)
+
+        risk = self._risk_scores.cpu()
+        conf = self._base_confidences.cpu()
 
         for ridx in range(len(self._rules)):
             clause_indices = self._rule_boundaries.get(
@@ -151,8 +155,8 @@ class RuleEngine:
                 combined = torch.stack(clause_results, dim=1).any(dim=1)
             hit_mat[:, ridx] = combined
 
-        rule_score = self._aggregate_scores(hit_mat)
-        rule_confidence = self._aggregate_confidence(hit_mat)
+        rule_score = self._aggregate_scores(hit_mat, risk_scores=risk, base_confidences=conf)
+        rule_confidence = self._aggregate_confidence(hit_mat, base_confidences=conf)
         if _cpu and self.device.type != "cpu":
             rule_score = rule_score.to(self.device)
             rule_confidence = rule_confidence.to(self.device)
@@ -168,14 +172,15 @@ class RuleEngine:
     ) -> torch.Tensor:
         c = self._compiled[ci]
         field = c["field"]
+        batch_device = next(iter(batch.values())).device if batch else self.device
         if field not in batch:
-            return torch.zeros(n, dtype=torch.bool, device=self.device)
+            return torch.zeros(n, dtype=torch.bool, device=batch_device)
         x = batch[field].view(-1)
 
         if c["is_string"]:
             val = c.get("value_num")
             if val is None:
-                return torch.zeros(n, dtype=torch.bool, device=self.device)
+                return torch.zeros(n, dtype=torch.bool, device=batch_device)
         else:
             val = c["value_num"]
 
@@ -197,24 +202,27 @@ class RuleEngine:
         elif op == "in":
             if not isinstance(val, (list, tuple)):
                 val = [val]
-            result = torch.zeros(n, dtype=torch.bool, device=self.device)
+            result = torch.zeros(n, dtype=torch.bool, device=batch_device)
             for v in val:
                 result = result | (x == float(v) if not c["is_string"] else (x == v))
             return result
         elif op == "not_in":
             if not isinstance(val, (list, tuple)):
                 val = [val]
-            result = torch.ones(n, dtype=torch.bool, device=self.device)
+            result = torch.ones(n, dtype=torch.bool, device=batch_device)
             for v in val:
                 result = result & (x != (float(v) if not c["is_string"] else v))
             return result
         else:
             logger.warning("Unknown operator %s, returning False", op)
-            return torch.zeros(n, dtype=torch.bool, device=self.device)
+            return torch.zeros(n, dtype=torch.bool, device=batch_device)
 
-    def _aggregate_scores(self, hit_mat: torch.Tensor) -> torch.Tensor:
+    def _aggregate_scores(self, hit_mat: torch.Tensor,
+                           risk_scores: Optional[torch.Tensor] = None,
+                           base_confidences: Optional[torch.Tensor] = None) -> torch.Tensor:
         """hit_mat: [batch, n_rules] bool → [batch, 1]"""
-        hit_float = hit_mat.float() * self._risk_scores.unsqueeze(0)  # [b, n]
+        rs = risk_scores if risk_scores is not None else self._risk_scores
+        hit_float = hit_mat.float() * rs.unsqueeze(0)  # [b, n]
         if self._aggregation == AggregationStrategy.MAX:
             val, _ = hit_float.max(dim=1, keepdim=True)
             return val
@@ -223,18 +231,21 @@ class RuleEngine:
             safe = torch.clamp(1.0 - hit_float, min=0.0, max=1.0)
             return 1.0 - safe.prod(dim=1, keepdim=True)
         elif self._aggregation == AggregationStrategy.WEIGHTED:
-            weights = self._base_confidences.unsqueeze(0)  # [1, n]
+            bn = base_confidences if base_confidences is not None else self._base_confidences
+            weights = bn.unsqueeze(0)  # [1, n]
             numer = (hit_float * weights).sum(dim=1, keepdim=True)
             denom = (hit_mat.float() * weights).sum(dim=1, keepdim=True).clamp_min(1e-8)
             return numer / denom
         else:
             return torch.zeros(hit_mat.size(0), 1, device=self.device)
 
-    def _aggregate_confidence(self, hit_mat: torch.Tensor) -> torch.Tensor:
+    def _aggregate_confidence(self, hit_mat: torch.Tensor,
+                               base_confidences: Optional[torch.Tensor] = None) -> torch.Tensor:
         """hit_mat: [batch, n_rules] bool → [batch, 1]"""
         n_rules = max(len(self._rules), 1)
+        bc = base_confidences if base_confidences is not None else self._base_confidences
         hit_count = hit_mat.float().sum(dim=1, keepdim=True)       # [b, 1]
-        avg_conf = (hit_mat.float() * self._base_confidences.unsqueeze(0)
+        avg_conf = (hit_mat.float() * bc.unsqueeze(0)
                     ).sum(dim=1, keepdim=True) / hit_count.clamp_min(1)
         hit_frac = hit_count / n_rules
         return avg_conf * (1.0 + hit_frac) / 2.0
