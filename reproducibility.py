@@ -23,6 +23,9 @@ def seed_everything(seed: int) -> dict:
         dgl.random.seed(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+    # Disable cuDNN to avoid "Unable to find a valid cuDNN algorithm"
+    # on Ada Lovelace / Hopper GPUs with certain cuDNN versions.
+    torch.backends.cudnn.enabled = False
     return {
         "seed": seed,
         "python_seeded": True,

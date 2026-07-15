@@ -154,7 +154,7 @@ class QwenRuleGenerator:
 
     def __init__(
         self,
-        api_url: str = "http://localhost:23333/v1/completions",
+        api_url: str = "http://localhost:23333/v1/chat/completions",
         model: str = "qwen",
         timeout: int = 120,
     ):
@@ -178,7 +178,7 @@ class QwenRuleGenerator:
         """
         payload = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "max_tokens": gen_kwargs.get("max_tokens", 4096),
             "temperature": gen_kwargs.get("temperature", 0.3),
             "top_p": gen_kwargs.get("top_p", 0.95),
@@ -189,7 +189,7 @@ class QwenRuleGenerator:
             )
             resp.raise_for_status()
             data = resp.json()
-            raw = data.get("choices", [{}])[0].get("text", "")
+            raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             return raw.strip() if raw else None
         except requests.RequestException as exc:
             logger.error("Qwen vLLM call failed: %s", exc)
