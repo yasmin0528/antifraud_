@@ -179,7 +179,7 @@ class QwenRuleGenerator:
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": gen_kwargs.get("max_tokens", 4096),
+            "max_tokens": gen_kwargs.get("max_tokens", 8192),
             "temperature": gen_kwargs.get("temperature", 0.3),
             "top_p": gen_kwargs.get("top_p", 0.95),
         }
@@ -410,7 +410,7 @@ def _few_shot_examples() -> str:
 def _build_ref_keys(stats: DatasetStatistics) -> set:
     keys = set()
     for field, groups in stats.numerical.items():
-        for group_name, values in (("all", groups),):
+        for group_name, values in groups.items():
             if not isinstance(values, dict):
                 continue
             for k in values:

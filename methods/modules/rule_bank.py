@@ -203,6 +203,27 @@ class RuleBank:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _extract_json(raw_text: str) -> str:
+    """Extract JSON from LLM response that may contain markdown code fences."""
+    # Remove leading/trailing whitespace
+    text = raw_text.strip()
+    # Try finding JSON inside ```json ... ``` blocks
+    for marker in ('```json', '```JSON', '```'):
+        if marker in text:
+            parts = text.split(marker, 1)
+            if len(parts) == 2:
+                candidate = parts[1]
+                # Find the closing ```
+                end = candidate.rfind('```')
+                if end != -1:
+                    candidate = candidate[:end]
+                candidate = candidate.strip()
+                # Quick validation: starts with { or [
+                if candidate.startswith('{') or candidate.startswith('['):
+                    return candidate
+    return text
+
+
 def validate_llm_output(
     raw_text: str,
     stats_ref_keys: set,
@@ -222,9 +243,10 @@ def validate_llm_output(
     report: dict = {"valid": False, "rules": [], "rejected_count": 0,
                     "warnings": [], "errors": []}
 
-    # Step 1 – JSON 解析
+    # Step 1 – JSON 解析（先提取 markdown 代码块中的 JSON）
+    json_candidate = _extract_json(raw_text)
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(json_candidate)
     except json.JSONDecodeError as exc:
         report["errors"].append(f"JSON parse failed: {exc}")
         return report
@@ -286,8 +308,8 @@ def _validate_rule_item(item: Any, stats_ref_keys: set,
         errs.append(f"rule_id '{rid}' must match R<digits≥3>")
 
     name = str(item.get("name", ""))
-    if not re.match(r"^[a-z_][a-z0-9_]{2,63}$", name):
-        errs.append(f"name '{name}' must be snake_case (3–64 chars)")
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]{2,63}$", name):
+        errs.append(f"name '{name}' must be 3–64 alphanumeric/underscore chars")
 
     cat = str(item.get("category", ""))
     if cat not in RULE_CATEGORIES:

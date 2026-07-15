@@ -52,7 +52,7 @@ def main():
     parser.add_argument("--max-rules", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--force", action="store_true", help="Overwrite existing YAML")
     args = parser.parse_args()
 

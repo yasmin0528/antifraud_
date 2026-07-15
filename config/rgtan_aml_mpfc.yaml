@@ -63,7 +63,7 @@ rulebank_path: config/rulebank/aml_rulebank_v1.yaml
 rulebank_force_generate: false          # 设为 true 可强制重新调用 LLM 生成
 vllm_api_url: "http://localhost:23333/v1/completions"
 vllm_model: "qwen"
-vllm_max_tokens: 4096
+vllm_max_tokens: 8192
 vllm_temperature: 0.3
 vllm_top_p: 0.95
 
