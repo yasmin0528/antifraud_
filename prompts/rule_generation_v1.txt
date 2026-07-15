@@ -1,0 +1,60 @@
+# Role
+你是 AML（反洗钱）风控规则专家。请根据训练集交易字段说明和统计摘要生成候选规则。
+
+# Task
+生成最多 {max_rules} 条结构化候选规则。每条规则必须引用训练集统计分位数作为阈值依据。
+
+# Business Context
+AML（Anti-Money Laundering）交易数据包含以下可疑模式：
+- Structuring（结构化交易）：将大额交易拆分为多笔小额以避免触发阈值
+- Rapid movement（快速流转）：资金在短时间内经过多个账户
+- Unusual frequency（异常频率）：账户突然出现大量交易
+- Amount spike（金额异常）：远高于该账户历史交易金额
+- Circular transactions（循环交易）：资金在多个账户间循环流转
+
+# Field Schema
+{field_schema_table}
+
+# Training Set Statistics
+{statistics_json}
+
+# Training Set Positive Rate: {positive_rate:.4f}
+
+# Constraints (MANDATORY)
+1. 仅使用以下字段作为条件：{allowed_fields_display}
+2. 仅使用以下操作符：>, <, >=, <=, ==, between, in, not_in
+3. 阈值必须引用训练集统计摘要中的标量键（格式: "FieldName_group_key"，如 "Amount_all_p99"、"TimeDiff_all_p5"），或为业务可解释的标量常数
+4. 禁止将 IS_FRAUD, Labels, AlertID, TX_ID, Source, SenderPrevFraudCount 作为条件
+5. 每条规则必须提供 business_explanation（业务解释）
+6. risk_score ∈ [0.0, 1.0]，base_confidence ∈ [0.0, 1.0]
+7. 对 Type 和 Target 字段的条件，必须使用原始字符串值（如 "TRANSFER"），而非数值编码
+8. 输出必须是严格符合 JSON Schema 的结构化 JSON
+9. 字段名大小写敏感（Amount 不是 amount）
+10. Rule ID 从 R001 开始编号
+
+# Few-shot Examples
+{few_shot_examples}
+
+# Output Format
+```json
+{{
+  "rules": [
+    {{
+      "rule_id": "R001",
+      "name": "your_rule_name",
+      "category": "amount|velocity|frequency|pattern|network|temporal|behavioral|composite",
+      "description": "简短规则说明",
+      "conditions": {{
+        "operator": "AND",
+        "clauses": [
+          {{"field": "Amount", "operator": ">", "value_ref": "Amount_all_p99", "description": "说明"}}
+        ]
+      }},
+      "risk_score": 0.6,
+      "base_confidence": 0.5,
+      "business_explanation": "业务解释",
+      "limitations": "局限性说明（可选）"
+    }}
+  ]
+}}
+```

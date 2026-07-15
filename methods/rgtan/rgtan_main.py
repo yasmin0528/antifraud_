@@ -1,6 +1,7 @@
 import os
 import copy
 import json
+import logging
 import time
 import tempfile
 from datetime import datetime
@@ -31,6 +32,14 @@ from feature_engineering.data_process import preprocess_aml_for_gtan
 from feature_engineering.ca1_cache import load_or_build_aml_ca1_cache
 from methods.modules.ca1 import CA1Encoder
 from methods.modules.ca3 import CA3PrototypeMemory
+from methods.modules.mpfc import MPFCDecisionFusion, binary_logits_to_risk_logit, MPFCOutput
+from methods.modules.rule_engine import RuleEngine
+from methods.modules.rule_generation import (
+    load_or_generate_rulebank, QwenRuleGenerator, compute_training_statistics,
+)
+from methods.modules.rule_bank import sha256_file
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_dataset_path(data_path: str) -> str:
@@ -368,7 +377,7 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
 def _update_experiment_index(results_dir, row):
     columns = [
         "run_id", "method", "dataset", "seed", "auc", "ap", "f1", "best_epoch",
-        "best_val_loss", "duration_seconds", "ca1_enabled", "ca3_enabled",
+        "best_val_loss", "duration_seconds", "ca1_enabled", "ca3_enabled", "mpfc_enabled",
         "ca3_num_prototypes", "ca3_warmup_epochs", "run_dir", "created_at", "status",
     ]
     path = os.path.join(results_dir, "experiment_index.csv")
@@ -1347,7 +1356,7 @@ def loda_rgtan_data(args):
             test_size=test_size,
             seed=args["seed"],
         )
-        if args.get("method") in {"rgtan", "rgtan_ca1", "rgtan_ca1_ca3"}:
+        if args.get("method") in {"rgtan", "rgtan_ca1", "rgtan_ca1_ca3", "rgtan_mpfc"}:
             remaining_groups = processed.iloc[train_idx]["Source"].reset_index(drop=True)
             remaining_labels = processed.iloc[train_idx]["Labels"].reset_index(drop=True)
             relative_train, relative_val = _sender_account_train_test_split(
@@ -1375,3 +1384,561 @@ def loda_rgtan_data(args):
         raise NotImplementedError(f"Unsupported RGTAN dataset: {dataset}")
 
     return feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# rgtan_mpfc_main — RGTAN + CA1 + CA3 + RuleBank + MPFC 融合训练入口
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_rulebank_field_tensors(
+    processed: pd.DataFrame,
+    device: torch.device,
+) -> tuple:
+    """为 RuleEngine 构建字段张量字典和 Type/Target 编码映射。
+
+    返回 (field_tensors, encoding_map)：
+      field_tensors: {field_name: [num_nodes, 1] tensor}
+      encoding_map:  {field_name: {str_value: int_id}}
+    """
+    encoding_map = {}
+
+    field_tensors = {}
+    for field in ("Amount", "TimeDiff", "SenderHistCount",
+                  "SenderHistAmountSum", "SenderHistAmountMean", "Time"):
+        field_tensors[field] = (
+            torch.from_numpy(processed[field].astype(float).values)
+            .float().unsqueeze(1).to(device)
+        )
+
+    for field in ("Type", "Target"):
+        raw = processed[field].astype(str)
+        le = LabelEncoder()
+        encoded = le.fit_transform(raw)
+        encoding_map[field] = dict(zip(le.classes_, le.transform(le.classes_)))
+        field_tensors[field] = (
+            torch.from_numpy(encoded).long().unsqueeze(1).to(device)
+        )
+
+    return field_tensors, encoding_map
+
+
+def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
+                           cat_features, neigh_features, nei_att_head):
+    warmup = int(args["ca3_warmup_epochs"])
+    if not 0 <= warmup < int(args["max_epochs"]):
+        raise ValueError("ca3_warmup_epochs must satisfy 0 <= warmup < max_epochs")
+    positive_train = np.asarray(train_idx)[labels.iloc[train_idx].to_numpy() == 1]
+    if len(positive_train) < int(args["ca3_num_prototypes"]):
+        raise ValueError("Training positives are fewer than ca3_num_prototypes")
+
+    started_dt = datetime.now().astimezone()
+    started_at = started_dt.isoformat()
+    stamp = started_dt.strftime("%Y%m%d_%H%M%S")
+    run_id = f"rgtan_mpfc_aml_seed{args['seed']}_{stamp}"
+    results_dir = args.get("results_dir", "results")
+    run_dir = os.path.join(results_dir, run_id)
+    os.makedirs(run_dir, exist_ok=False)
+    resolved = {k: v for k, v in args.items() if not k.startswith("_")}
+    resolved.update({"run_id": run_id, "run_dir": os.path.abspath(run_dir),
+                     "train_mode": "single_split"})
+    with open(os.path.join(run_dir, "config_resolved.yaml"), "w", encoding="utf-8") as handle:
+        yaml.safe_dump(resolved, handle, allow_unicode=True, sort_keys=False)
+    index_base = {
+        "run_id": run_id, "method": "rgtan_mpfc", "dataset": "aml",
+        "seed": args["seed"], "ca1_enabled": True, "ca3_enabled": True,
+        "mpfc_enabled": True, "ca3_num_prototypes": args["ca3_num_prototypes"],
+        "ca3_warmup_epochs": warmup, "run_dir": os.path.abspath(run_dir),
+        "created_at": started_at,
+    }
+    _update_experiment_index(results_dir, {**index_base, "status": "running"})
+
+    device = torch.device(args["device"])
+    graph = graph.to(device)
+    num_feat = torch.from_numpy(feat_df.values).float().to(device)
+    cat_feat = {col: torch.from_numpy(feat_df[col].values).long().to(device) for col in cat_features}
+    nei_feat = ({col: torch.from_numpy(neigh_features[col].values).float().to(device)
+                 for col in neigh_features.columns} if isinstance(neigh_features, pd.DataFrame) else [])
+    label_tensor = torch.from_numpy(labels.values).long().to(device)
+    known_label_tensor = torch.full_like(label_tensor, 2)
+    train_nodes_for_labels = torch.as_tensor(train_idx, dtype=torch.long, device=device)
+    known_label_tensor[train_nodes_for_labels] = label_tensor[train_nodes_for_labels]
+    cache = load_or_build_aml_ca1_cache(args["_aml_processed_path"], args["ca1_cache_path"],
+                                        args["_aml_sample_ids"], args["ca1_k"],
+                                        args["_aml_amount_mean"], args["_aml_amount_std"])
+    ca1_sequence, ca1_len, ca1_mask = cache["sequence"], cache["sequence_len"], cache["padding_mask"]
+
+    # ── RuleBank 加载 / 生成 ──────────────────────────────────────────
+    processed = pd.read_csv(args["_aml_processed_path"])
+    rulebank_path = args.get("rulebank_path",
+                             os.path.join("config", "rulebank", "aml_rulebank_v1.yaml"))
+    prompt_path = args.get("prompt_path",
+                           os.path.join("prompts", "rule_generation_v1.txt"))
+    data_fingerprint = sha256_file(args["_aml_processed_path"])
+    force_generate = args.get("rulebank_force_generate", False)
+
+    vllm_client = QwenRuleGenerator(
+        api_url=args.get("vllm_api_url", "http://localhost:23333/v1/completions"),
+        model=args.get("vllm_model", "qwen"),
+    )
+
+    rulebank = load_or_generate_rulebank(
+        rulebank_path=rulebank_path,
+        prompt_path=prompt_path,
+        processed=processed,
+        train_idx=train_idx,
+        llm_client=vllm_client,
+        data_fingerprint=data_fingerprint,
+        force=force_generate,
+        prompt_version="1.0",
+    )
+
+    # ── RuleEngine 字段张量与编码映射 ──────────────────────────────────
+    field_tensors, encoding_map = _build_rulebank_field_tensors(processed, device)
+    rule_engine = RuleEngine(
+        rulebank=rulebank,
+        encoding_map=encoding_map,
+        aggregation=args.get("mpfc_aggregation", "noisy_or"),
+        device=device,
+    )
+
+    # ── 模型 ──────────────────────────────────────────────────────────
+    def make_loader(indices, shuffle=False):
+        return NodeDataLoader(
+            graph, torch.as_tensor(indices, dtype=torch.long, device=device),
+            MultiLayerFullNeighborSampler(args["n_layers"]), device=device, use_ddp=False,
+            batch_size=args["batch_size"], shuffle=shuffle, drop_last=False, num_workers=0)
+
+    train_loader, val_loader, test_loader = (
+        make_loader(train_idx, True), make_loader(val_idx), make_loader(test_idx))
+
+    model = RGTAN(
+        in_feats=feat_df.shape[1], hidden_dim=args["hid_dim"] // 4, n_classes=2,
+        heads=[4] * args["n_layers"], activation=nn.PReLU(), n_layers=args["n_layers"],
+        drop=args["dropout"], device=device, gated=args["gated"], ref_df=feat_df,
+        cat_features=cat_feat, neigh_features=nei_feat, nei_att_head=nei_att_head,
+        ca1_hidden_dim=args["ca1_hidden_dim"]).to(device)
+
+    ca1 = CA1Encoder(4, args["ca1_hidden_dim"], args["ca1_dropout"],
+                     args["ca1_encoder_type"], args["ca1_pooling"]).to(device)
+
+    ca3 = CA3PrototypeMemory(
+        args["ca1_hidden_dim"], args["ca3_num_prototypes"], args["ca3_temperature"],
+        args["ca3_top_k"], args["ca3_fusion"],
+        gate_bias_init=args.get("ca3_gate_bias_init", -2.0),
+        gate_bias_final=args.get("ca3_gate_bias_final", -1.0),
+        anneal_epochs=args.get("ca3_anneal_epochs", 10),
+        dead_epoch_threshold=args.get("ca3_dead_threshold", 3),
+        entropy_gate_beta=args.get("ca3_entropy_gate_beta", 1.0),
+        contrastive_temperature=args.get("ca3_contrastive_temperature", 0.1),
+        diversity_margin=args.get("ca3_diversity_margin", 0.5),
+    ).to(device)
+
+    # MPFC 决策融合
+    mpfc = MPFCDecisionFusion(
+        input_dim=model.classification_input_dim,
+        hidden_dim=args.get("mpfc_hidden_dim", 64),
+        dropout=args.get("mpfc_dropout", 0.1),
+        gate_bias_init=args.get("mpfc_gate_bias_init", -2.0),
+        confidence_constrained=args.get("mpfc_confidence_constrained", True),
+    ).to(device)
+
+    optimizer = optim.Adam(
+        list(model.parameters()) + list(ca1.parameters()) + list(ca3.parameters())
+        + list(mpfc.parameters()),
+        lr=args["lr"] * np.sqrt(args["batch_size"] / 1024), weight_decay=args["wd"])
+    scheduler = MultiStepLR(optimizer, milestones=[4000, 12000], gamma=0.3)
+    main_loss_fn = nn.CrossEntropyLoss().to(device)
+    binary_loss_fn = nn.BCEWithLogitsLoss().to(device)
+
+    # ── CA3 初始化 ────────────────────────────────────────────────────
+    def initialize_ca3():
+        model.eval(); ca1.eval(); embeddings = []
+        with torch.no_grad():
+            for start in range(0, len(positive_train), args["batch_size"]):
+                nodes = torch.as_tensor(positive_train[start:start + args["batch_size"]], dtype=torch.long)
+                emb, _, _ = ca1(ca1_sequence[nodes].to(device), ca1_len[nodes].to(device),
+                                ca1_mask[nodes].to(device))
+                embeddings.append(emb.cpu())
+        matrix = torch.cat(embeddings).numpy()
+        kmeans = MiniBatchKMeans(n_clusters=args["ca3_num_prototypes"], random_state=args["seed"],
+                                 batch_size=max(args["batch_size"], args["ca3_num_prototypes"]),
+                                 n_init=10)
+        kmeans.fit(matrix)
+        ca3.initialize_prototypes(kmeans.cluster_centers_)
+
+    positive_emb_pool = None
+
+    def build_positive_embedding_pool():
+        model.eval(); ca1.eval(); emb_list = []
+        with torch.no_grad():
+            for start in range(0, len(positive_train), args["batch_size"]):
+                nodes = torch.as_tensor(positive_train[start:start + args["batch_size"]], dtype=torch.long)
+                emb, _, _ = ca1(ca1_sequence[nodes].to(device), ca1_len[nodes].to(device),
+                                ca1_mask[nodes].to(device))
+                emb_list.append(emb.cpu())
+        return torch.cat(emb_list)
+
+    def forward_batch(input_nodes, seeds, blocks, ca3_enabled):
+        inputs, work_inputs, neigh_inputs, batch_labels, lpa_labels = load_lpa_subtensor(
+            num_feat, cat_feat, nei_feat, {}, label_tensor, seeds, input_nodes, device, blocks,
+            known_label_tensor)
+        cpu_nodes = input_nodes.detach().cpu().long()
+        ca1_embedding, ca1_logit, ca1_score = ca1(
+            ca1_sequence[cpu_nodes].to(device), ca1_len[cpu_nodes].to(device),
+            ca1_mask[cpu_nodes].to(device))
+        ca3_out = ca3(ca1_embedding, enabled=ca3_enabled)
+        local = _seed_local_indices(input_nodes, seeds)
+
+        # RGTAN with hidden state → MPFC rule-neural fusion
+        class_logits, hidden = model(
+            [block.to(device) for block in blocks], inputs, lpa_labels,
+            work_inputs, neigh_inputs, ca1_embedding=ca3_out.enhanced_embedding,
+            return_hidden=True)
+
+        # Neural risk logit (class logits → risk logit)
+        neural_logit = binary_logits_to_risk_logit(class_logits)
+
+        # Rule evaluation
+        seed_indices = seeds.detach().cpu().long()
+        rule_batch = {
+            name: tensors[seed_indices]
+            for name, tensors in field_tensors.items()
+        }
+        rule_score, rule_confidence = rule_engine.evaluate(rule_batch)
+
+        # MPFC fusion
+        mpfc_out = mpfc(hidden, neural_logit, rule_score, rule_confidence)
+
+        return mpfc_out, class_logits, ca1_logit[local], ca1_score[local], \
+               ca3_out, local, batch_labels, ca1_embedding, rule_score, rule_confidence
+
+    # ── 训练循环 ──────────────────────────────────────────────────────
+    if warmup == 0:
+        initialize_ca3()
+        positive_emb_pool = build_positive_embedding_pool()
+
+    best_loss, best_state, stale = float("inf"), None, 0
+    history_path = os.path.join(run_dir, "epoch_history.csv")
+    checkpoint_path = os.path.join(run_dir, "best_checkpoint.pt")
+
+    for epoch in tqdm(range(args["max_epochs"]), desc="epochs", unit="epoch"):
+        ca3_enabled = bool(ca3.initialized.item())
+        epoch_started = time.perf_counter()
+
+        if ca3_enabled:
+            anneal_epochs = args.get("ca3_anneal_epochs", 10)
+            anneal_progress = max(0.0, min(1.0, (epoch - warmup) / anneal_epochs))
+            ca3.set_anneal_progress(anneal_progress)
+
+        model.train(); ca1.train(); ca3.train(); mpfc.train()
+        accum = {key: [] for key in ("main", "ca1", "contrastive", "div", "total", "gate")}
+        train_y, train_score, train_pred = [], [], []
+        train_entropy, train_ids, train_gates, train_rule_scores = [], [], [], []
+
+        for input_nodes, seeds, blocks in tqdm(train_loader, desc=f"epoch {epoch + 1:02d} train",
+                                               leave=False, unit="batch"):
+            mpfc_out, class_logits, ca1_logit, _, ca3_out, local, batch_labels, ca1_emb, \
+                rule_score, rule_confidence = forward_batch(input_nodes, seeds, blocks, ca3_enabled)
+
+            valid = batch_labels != 2
+            if not valid.any():
+                continue
+
+            # MPFC final logit loss
+            main_loss = main_loss_fn(class_logits[valid], batch_labels[valid])
+            ca1_loss = binary_loss_fn(ca1_logit[valid].squeeze(-1), batch_labels[valid].float())
+            if ca3_enabled:
+                contrastive = ca3.contrastive_loss(ca1_emb)
+                diversity = ca3.diversity_loss()
+            else:
+                contrastive = main_loss.new_zeros(())
+                diversity = main_loss.new_zeros(())
+            total = (main_loss + args["ca1_aux_weight"] * ca1_loss
+                     + args.get("ca3_contrastive_weight", 0.1) * contrastive
+                     + args.get("ca3_diversity_weight", 0.001) * diversity)
+            optimizer.zero_grad()
+            total.backward()
+            optimizer.step()
+            scheduler.step()
+
+            for key, value in zip(accum,
+                                  (main_loss, ca1_loss, contrastive, diversity, total,
+                                   mpfc_out.fusion_weight.mean())):
+                accum[key].append(value.item())
+
+            probs = torch.softmax(class_logits[valid].detach(), dim=1)[:, 1]
+            train_y += batch_labels[valid].cpu().tolist()
+            train_score += probs.cpu().tolist()
+            train_pred += (probs >= 0.5).long().cpu().tolist()
+            train_rule_scores += rule_score[valid].squeeze(-1).cpu().tolist()
+            if ca3_enabled:
+                train_entropy += ca3_out.assignment_entropy[local][valid].detach().cpu().tolist()
+                train_ids += ca3_out.top_proto_id[local][valid].detach().cpu().tolist()
+                train_gates += ca3_out.gate_probs[local][valid].detach().squeeze(-1).cpu().tolist()
+
+        # ── 验证 ──────────────────────────────────────────────────────
+        def evaluate(loader, desc):
+            model.eval(); ca1.eval(); ca3.eval(); mpfc.eval()
+            result = {key: [] for key in ("main", "ca1", "contrastive", "div", "total", "gate")}
+            ys, scores, preds, entropies, proto_ids, gates, rule_scores = [], [], [], [], [], [], []
+            with torch.no_grad():
+                for input_nodes, seeds, blocks in tqdm(loader, desc=desc, leave=False, unit="batch"):
+                    mpfc_out, class_logits, ca1_logit, _, out, local, batch_labels, ca1_emb, \
+                        rule_score, _ = forward_batch(input_nodes, seeds, blocks, ca3_enabled)
+                    valid = batch_labels != 2
+                    if not valid.any():
+                        continue
+                    ml = main_loss_fn(class_logits[valid], batch_labels[valid])
+                    c1 = binary_loss_fn(ca1_logit[valid].squeeze(-1), batch_labels[valid].float())
+                    contrastive = (ca3.contrastive_loss(ca1_emb) if ca3_enabled else ml.new_zeros(()))
+                    div = ca3.diversity_loss() if ca3_enabled else ml.new_zeros(())
+                    total = (ml + args["ca1_aux_weight"] * c1
+                             + args.get("ca3_contrastive_weight", 0.1) * contrastive
+                             + args.get("ca3_diversity_weight", 0.001) * div)
+                    for key, value in zip(result, (ml, c1, contrastive, div, total,
+                                                   mpfc_out.fusion_weight.mean())):
+                        result[key].append(value.item())
+                    prob = torch.softmax(class_logits[valid], dim=1)[:, 1]
+                    ys += batch_labels[valid].cpu().tolist()
+                    scores += prob.cpu().tolist()
+                    preds += (prob >= 0.5).long().cpu().tolist()
+                    rule_scores += rule_score[valid].squeeze(-1).cpu().tolist()
+                    if ca3_enabled:
+                        entropies += out.assignment_entropy[local][valid].cpu().tolist()
+                        proto_ids += out.top_proto_id[local][valid].cpu().tolist()
+                        gates += out.gate_probs[local][valid].squeeze(-1).cpu().tolist()
+            return result, ys, scores, preds, entropies, proto_ids, gates, rule_scores
+
+        val_losses, val_y, val_scores, val_preds, val_entropy, val_ids, val_gates, val_rule_scores = \
+            evaluate(val_loader, f"epoch {epoch + 1:02d} val")
+        train_metrics = _classification_metrics(train_y, train_score, train_pred)
+        val_metrics = _classification_metrics(val_y, val_scores, val_preds)
+        val_main = float(np.mean(val_losses["main"]))
+        row = {
+            "run_id": run_id, "timestamp": datetime.now().astimezone().isoformat(),
+            "epoch": epoch + 1, "epoch_seconds": time.perf_counter() - epoch_started,
+            "ca3_enabled": ca3_enabled, "mpfc_enabled": True,
+        }
+        for prefix, values in (("train", accum), ("val", val_losses)):
+            for name, values_list in values.items():
+                row[f"{prefix}_{name}_loss"] = float(np.mean(values_list))
+        for prefix, values in (("train", train_metrics), ("val", val_metrics)):
+            for name, value in values.items():
+                row[f"{prefix}_{name}"] = value
+        row.update({
+            "train_assignment_entropy": float(np.mean(train_entropy)) if train_entropy else np.nan,
+            "val_assignment_entropy": float(np.mean(val_entropy)) if val_entropy else np.nan,
+            "train_prototype_used_count": len(set(train_ids)),
+            "val_prototype_used_count": len(set(val_ids)),
+            "train_gate_mean": float(np.mean(train_gates)) if train_gates else np.nan,
+            "val_gate_mean": float(np.mean(val_gates)) if val_gates else np.nan,
+            "train_rule_score_mean": float(np.mean(train_rule_scores)) if train_rule_scores else np.nan,
+            "val_rule_score_mean": float(np.mean(val_rule_scores)) if val_rule_scores else np.nan,
+            "train_rule_score_hit_ratio": (
+                float(np.mean(np.asarray(train_rule_scores) > 0)) if train_rule_scores else np.nan
+            ),
+            "val_rule_score_hit_ratio": (
+                float(np.mean(np.asarray(val_rule_scores) > 0)) if val_rule_scores else np.nan
+            ),
+            "is_best": ca3_enabled and val_main < best_loss,
+        })
+        pd.DataFrame([row]).to_csv(history_path, mode="a",
+                                    header=not os.path.exists(history_path), index=False)
+        if row["is_best"]:
+            best_loss, stale = val_main, 0
+            best_state = {
+                "checkpoint_schema_version": 2,
+                "method": "rgtan_mpfc", "dataset": "aml", "seed": args["seed"],
+                "rgtan_state_dict": copy.deepcopy(model.state_dict()),
+                "ca1_state_dict": copy.deepcopy(ca1.state_dict()),
+                "ca3_state_dict": copy.deepcopy(ca3.state_dict()),
+                "mpfc_state_dict": copy.deepcopy(mpfc.state_dict()),
+                "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
+                "scheduler_state_dict": copy.deepcopy(scheduler.state_dict()),
+                "best_epoch": epoch + 1, "best_val_metric": val_main,
+                "ca3_initialized": True, "ca3_init_epoch": warmup,
+                "config": resolved, "rulebank_path": rulebank_path,
+                "rulebank_version": rulebank.rulebank_version,
+            }
+            torch.save(best_state, checkpoint_path)
+        elif ca3_enabled:
+            stale += 1
+            if stale >= args["early_stopping"]:
+                break
+
+        if ca3_enabled:
+            ca3.on_epoch_end()
+            n_refreshed = ca3.refresh_dead_prototypes(
+                positive_emb_pool.to(ca3.prototypes.device))
+            if n_refreshed > 0:
+                logger.info(f"Refreshed {n_refreshed} dead prototypes at epoch {epoch + 1}")
+
+        if not ca3_enabled and epoch + 1 == warmup:
+            initialize_ca3()
+            positive_emb_pool = build_positive_embedding_pool().to(device)
+            best_loss, stale = float("inf"), 0
+
+    # ── 最终评估 ──────────────────────────────────────────────────────
+    if best_state is None or not best_state.get("ca3_initialized", False):
+        raise RuntimeError("No initialised checkpoint was selected")
+
+    model.load_state_dict(best_state["rgtan_state_dict"])
+    ca1.load_state_dict(best_state["ca1_state_dict"])
+    ca3.load_state_dict(best_state["ca3_state_dict"])
+    mpfc.load_state_dict(best_state["mpfc_state_dict"])
+    optimizer.load_state_dict(best_state["optimizer_state_dict"])
+    scheduler.load_state_dict(best_state["scheduler_state_dict"])
+
+    ca3_enabled = True; mpfc.eval()
+    val_eval = evaluate(val_loader, "best checkpoint val")
+    threshold, val_f1 = best_macro_f1_threshold(val_eval[1], val_eval[2])
+
+    model.eval(); ca1.eval(); ca3.eval()
+    test_y, test_scores = [], []
+    assignments = []
+    with torch.no_grad():
+        for input_nodes, seeds, blocks in tqdm(test_loader, desc="best checkpoint test",
+                                                leave=False, unit="batch"):
+            mpfc_out, class_logits, _, ca1_score, out, local, batch_labels, _, \
+                rule_score, rule_confidence = forward_batch(input_nodes, seeds, blocks, True)
+            valid = batch_labels != 2
+            seed_ids = seeds[valid].detach().cpu().tolist()
+            score = torch.softmax(class_logits[valid], dim=1)[:, 1]
+            test_y += batch_labels[valid].cpu().tolist()
+            test_scores += score.cpu().tolist()
+            for j, node_id in enumerate(seed_ids):
+                assignments.append({
+                    "TX_ID": args["_aml_sample_ids"][node_id],
+                    "label": int(batch_labels[valid][j].item()),
+                    "rgtan_score": float(score[j].item()),
+                    "mpfc_fusion_weight": float(mpfc_out.fusion_weight[valid][j].item()),
+                    "mpfc_neural_score": float(mpfc_out.neural_score[valid][j].item()),
+                    "mpfc_rule_score": float(mpfc_out.rule_score[valid][j].item()),
+                    "mpfc_final_score": float(mpfc_out.score_mid[valid][j].item()),
+                    "rule_confidence": float(rule_confidence[valid][j].item()),
+                    "ca1_score_micro": float(ca1_score[valid][j].item()),
+                    "top_proto_id": int(out.top_proto_id[local][valid][j].item()),
+                    "top_proto_sim": float(out.top_proto_sim[local][valid][j].item()),
+                    "assignment_entropy": float(out.assignment_entropy[local][valid][j].item()),
+                    "gate": float(out.gate_probs[local][valid][j].item()),
+                    "node_id": node_id,
+                })
+
+    test_preds = (np.asarray(test_scores) >= threshold).astype(int)
+    test_metric = _classification_metrics(test_y, test_scores, test_preds)
+
+    # ── 保存结果 ──────────────────────────────────────────────────────
+    final = {
+        "run_id": run_id, "method": "rgtan_mpfc", "dataset": "aml", "seed": args["seed"],
+        "test_auc": test_metric["auc"], "test_ap": test_metric["ap"],
+        "test_f1": test_metric["f1"],
+        "test_precision": float(precision_score(test_y, test_preds, zero_division=0)),
+        "test_recall": float(recall_score(test_y, test_preds, zero_division=0)),
+        "test_threshold": threshold,
+        "val_auc_at_best": _classification_metrics(
+            val_eval[1], val_eval[2],
+            (np.asarray(val_eval[2]) >= threshold).astype(int))["auc"],
+        "val_ap_at_best": _classification_metrics(
+            val_eval[1], val_eval[2],
+            (np.asarray(val_eval[2]) >= threshold).astype(int))["ap"],
+        "val_f1_at_best": val_f1,
+        "best_epoch": best_state["best_epoch"], "best_val_loss": best_loss,
+        "duration_seconds": (datetime.now().astimezone() - started_dt).total_seconds(),
+        "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
+        "ca1_enabled": True, "ca3_enabled": True, "mpfc_enabled": True,
+        "ca3_num_prototypes": args["ca3_num_prototypes"],
+        "ca3_warmup_epochs": warmup,
+        "rulebank_path": rulebank_path,
+        "rulebank_version": rulebank.rulebank_version,
+        "rulebank_num_rules": len(rulebank.active_rules()),
+    }
+    pd.DataFrame([final]).to_csv(os.path.join(run_dir, "final_metrics.csv"), index=False)
+
+    assignment_df = pd.DataFrame(assignments)
+    assignment_df.to_csv(os.path.join(run_dir, "prototype_assignments.csv"), index=False)
+    processed_ids = pd.read_csv(args["_aml_processed_path"])[["TX_ID", "AlertID"]]
+    assignment_df["TX_ID"] = assignment_df["TX_ID"].astype(str)
+    processed_ids["TX_ID"] = processed_ids["TX_ID"].astype(str)
+    explained = assignment_df.merge(processed_ids, on="TX_ID", how="left")
+
+    summaries = []
+    for proto_id in range(args["ca3_num_prototypes"]):
+        group = explained[explained["top_proto_id"] == proto_id]
+        alert_counts = group["AlertID"].value_counts(dropna=True)
+        summaries.append({
+            "prototype_id": proto_id, "assigned_sample_count": len(group),
+            "positive_sample_count": int(group["label"].sum()) if len(group) else 0,
+            "positive_rate": float(group["label"].mean()) if len(group) else np.nan,
+            "avg_similarity": float(group["top_proto_sim"].mean()) if len(group) else np.nan,
+            "avg_gate": float(group["gate"].mean()) if len(group) else np.nan,
+            "avg_fusion_weight": float(group["mpfc_fusion_weight"].mean()) if len(group) else np.nan,
+            "unique_alert_id_count": int(group["AlertID"].nunique()),
+            "top_alert_id": alert_counts.index[0] if len(alert_counts) else None,
+            "top_alert_id_count": int(alert_counts.iloc[0]) if len(alert_counts) else 0,
+            "top_alert_id_ratio": (
+                float(alert_counts.iloc[0] / len(group))
+                if len(group) and len(alert_counts) else 0.0
+            ),
+        })
+    pd.DataFrame(summaries).to_csv(os.path.join(run_dir, "prototype_summary.csv"), index=False)
+
+    metadata = {
+        **index_base, **final, "base_method": "rgtan", "train_mode": "single_split",
+        "split_mode": args["split_mode"], "ca3_initialized": True,
+        "ca3_init_epoch": warmup, "ca3_init_data": "train_positive_only",
+        "split_seed": args["seed"], "validation_split_seed": args["seed"] + 1,
+        "ca3_kmeans_random_state": args["seed"],
+        "reproducibility": args.get("reproducibility", {}),
+        "ca1_cache_fingerprint": cache["source_fingerprint"],
+        "rulebank_fingerprint": data_fingerprint,
+        "rulebank_prompt_version": "1.0",
+        "resolved_config_file": "config_resolved.yaml",
+        "alert_id_used_in_forward": False, "label_derived_neighbor_features": False,
+        "label_propagation_scope": "train_only",
+        "amount_normalization_scope": "train_split",
+        "graph_feature_setting": "transductive_features_train_labels_only",
+        "finished_at": datetime.now().astimezone().isoformat(),
+    }
+    with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    _update_experiment_index(results_dir, {**index_base, "auc": final["test_auc"],
+                                           "ap": final["test_ap"], "f1": final["test_f1"],
+                                           "best_epoch": final["best_epoch"],
+                                           "best_val_loss": best_loss,
+                                           "duration_seconds": final["duration_seconds"],
+                                           "status": "success"})
+    return final
+
+
+def rgtan_mpfc_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
+                     cat_features, neigh_features, nei_att_head):
+    """rgtan_mpfc 训练入口（带异常处理与实验索引回退）。"""
+    results_dir = args.get("results_dir", "results")
+    os.makedirs(results_dir, exist_ok=True)
+    prefix = f"rgtan_mpfc_aml_seed{args['seed']}_"
+    before = {name for name in os.listdir(results_dir) if name.startswith(prefix)}
+    try:
+        return _rgtan_mpfc_main_impl(
+            feat_df, graph, train_idx, val_idx, test_idx, labels, args,
+            cat_features, neigh_features, nei_att_head)
+    except BaseException as exc:
+        after = {name for name in os.listdir(results_dir) if name.startswith(prefix)}
+        created = sorted(after - before)
+        if created:
+            run_id = created[-1]
+            status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+            failure = {
+                "run_id": run_id, "method": "rgtan_mpfc", "dataset": "aml",
+                "seed": args["seed"], "ca1_enabled": True, "ca3_enabled": True,
+                "mpfc_enabled": True,
+                "ca3_num_prototypes": args["ca3_num_prototypes"],
+                "ca3_warmup_epochs": args["ca3_warmup_epochs"],
+                "run_dir": os.path.abspath(os.path.join(results_dir, run_id)),
+                "created_at": datetime.now().astimezone().isoformat(),
+                "status": status,
+                "error_type": type(exc).__name__, "error_message": str(exc),
+            }
+            _update_experiment_index(results_dir, failure)
+            with open(os.path.join(results_dir, run_id, "failure.json"), "w", encoding="utf-8") as handle:
+                json.dump(failure, handle, ensure_ascii=False, indent=2)
+        raise

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/c/Users/琳/.conda/pkgs/python-3.10.20-h1044e36_0/python.exe -c \"print\\('hello'\\)\")",
+      "Bash(py --version)"
+    ]
+  }
+}

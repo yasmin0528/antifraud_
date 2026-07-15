@@ -20,10 +20,15 @@ import torch.nn as nn
 import yaml
 from dgl.dataloading import MultiLayerFullNeighborSampler, NodeDataLoader
 from sklearn.metrics import precision_score, recall_score
+from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 
 from feature_engineering.ca1_cache import load_or_build_aml_ca1_cache
 from methods.modules.ca1 import CA1Encoder
+from methods.modules.ca3 import CA3PrototypeMemory
+from methods.modules.mpfc import MPFCDecisionFusion, binary_logits_to_risk_logit
+from methods.modules.rule_engine import RuleEngine
+from methods.modules.rule_bank import RuleBank
 from methods.rgtan.evaluation import best_macro_f1_threshold
 from methods.rgtan.rgtan_lpa import load_lpa_subtensor
 from methods.rgtan.rgtan_main import (
@@ -34,7 +39,7 @@ from methods.rgtan.rgtan_main import (
 from methods.rgtan.rgtan_model import RGTAN
 
 
-SUPPORTED_METHODS = {"rgtan", "rgtan_ca1"}
+SUPPORTED_METHODS = {"rgtan", "rgtan_ca1", "rgtan_mpfc"}
 
 
 def _torch_load(path, device):
@@ -59,8 +64,10 @@ def _find_checkpoint(path):
 
 
 def _infer_method(checkpoint):
+    if "mpfc_state_dict" in checkpoint:
+        return "rgtan_mpfc"
     if "ca3_state_dict" in checkpoint:
-        raise ValueError("CA3 checkpoint finalization is not handled by this recovery script")
+        raise ValueError("CA3 checkpoint without MPFC is not handled by this recovery script")
     if "ca1_state_dict" in checkpoint or "ca1" in checkpoint:
         return "rgtan_ca1"
     if "rgtan_state_dict" in checkpoint or "model" in checkpoint:
@@ -95,7 +102,9 @@ def _load_run_args(run_dir, checkpoint, method, device_override):
     else:
         args = dict(checkpoint.get("config") or checkpoint.get("args") or {})
     if not args:
-        default_name = "rgtan_aml_ca1.yaml" if method == "rgtan_ca1" else "rgtan_aml_cfg.yaml"
+        config_map = {"rgtan": "rgtan_aml_cfg.yaml", "rgtan_ca1": "rgtan_aml_ca1.yaml",
+                      "rgtan_mpfc": "rgtan_aml_mpfc.yaml"}
+        default_name = config_map.get(method, "rgtan_aml_cfg.yaml")
         with (Path(__file__).parent / "config" / default_name).open(encoding="utf-8") as handle:
             args = yaml.safe_load(handle)
     args["method"] = method
@@ -214,25 +223,87 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             cat_features=cat_feat, neigh_features=nei_feat,
             nei_att_head=args["nei_att_heads"]["aml"],
         )
-        ca1 = None
-        if method == "rgtan_ca1":
+        # ── 模型加载（按 method 分支） ──────────────────────────────────
+        ca1, ca3, mpfc, rule_engine, field_tensors = None, None, None, None, None
+        needs_ca1 = method in ("rgtan_ca1", "rgtan_mpfc")
+        model_kwargs = dict(
+            in_feats=feat_df.shape[1], hidden_dim=args["hid_dim"] // 4, n_classes=2,
+            heads=[4] * args["n_layers"], activation=nn.PReLU(), n_layers=args["n_layers"],
+            drop=args["dropout"], device=device, gated=args["gated"], ref_df=feat_df,
+            cat_features=cat_feat, neigh_features=nei_feat,
+            nei_att_head=args["nei_att_heads"]["aml"],
+        )
+        if needs_ca1:
             model_kwargs["ca1_hidden_dim"] = args["ca1_hidden_dim"]
             ca1 = CA1Encoder(4, args["ca1_hidden_dim"], args["ca1_dropout"],
                              args["ca1_encoder_type"], args["ca1_pooling"]).to(device)
             cache = load_or_build_aml_ca1_cache(
                 args["_aml_processed_path"], args["ca1_cache_path"], args["_aml_sample_ids"],
                 args["ca1_k"], args["_aml_amount_mean"], args["_aml_amount_std"])
-            ca1_sequence = cache["sequence"]
-            ca1_len = cache["sequence_len"]
-            ca1_mask = cache["padding_mask"]
-        model = RGTAN(**model_kwargs).to(device)
-        _load_rgtan_state(
-            model, checkpoint.get("rgtan_state_dict", checkpoint.get("model")))
-        if ca1 is not None:
+            ca1_sequence, ca1_len, ca1_mask = (
+                cache["sequence"], cache["sequence_len"], cache["padding_mask"])
             ca1.load_state_dict(checkpoint.get("ca1_state_dict", checkpoint.get("ca1")))
             ca1.eval()
+
+            if method == "rgtan_mpfc":
+                # CA3
+                ca3 = CA3PrototypeMemory(
+                    args["ca1_hidden_dim"], args["ca3_num_prototypes"], args["ca3_temperature"],
+                    args["ca3_top_k"], args["ca3_fusion"],
+                    gate_bias_init=args.get("ca3_gate_bias_init", -2.0),
+                    gate_bias_final=args.get("ca3_gate_bias_final", -1.0),
+                    anneal_epochs=args.get("ca3_anneal_epochs", 10),
+                    dead_epoch_threshold=args.get("ca3_dead_threshold", 3),
+                    entropy_gate_beta=args.get("ca3_entropy_gate_beta", 1.0),
+                    contrastive_temperature=args.get("ca3_contrastive_temperature", 0.1),
+                    diversity_margin=args.get("ca3_diversity_margin", 0.5),
+                ).to(device)
+                ca3.load_state_dict(checkpoint["ca3_state_dict"])
+                ca3.eval()
+
+                # MPFC
+                mpfc = MPFCDecisionFusion(
+                    input_dim=model_kwargs["heads"][-1] * (model_kwargs["hidden_dim"]),
+                    hidden_dim=args.get("mpfc_hidden_dim", 64),
+                    dropout=args.get("mpfc_dropout", 0.1),
+                    gate_bias_init=args.get("mpfc_gate_bias_init", -2.0),
+                    confidence_constrained=args.get("mpfc_confidence_constrained", True),
+                ).to(device)
+                mpfc.load_state_dict(checkpoint["mpfc_state_dict"])
+                mpfc.eval()
+
+                # RuleEngine
+                processed = pd.read_csv(args["_aml_processed_path"])
+                encoding_map = {}
+                for ef in ("Type", "Target"):
+                    raw = processed[ef].astype(str)
+                    le = LabelEncoder()
+                    le.fit(raw)
+                    encoding_map[ef] = dict(zip(le.classes_, le.transform(le.classes_)))
+                rbp = args.get("rulebank_path", "config/rulebank/aml_rulebank_v1.yaml")
+                rulebank = RuleBank.load(rbp)
+                rule_engine = RuleEngine(
+                    rulebank, encoding_map=encoding_map,
+                    aggregation=args.get("mpfc_aggregation", "noisy_or"),
+                    device=device)
+                # Pre-build full field tensors (used in collect)
+                field_tensors = {}
+                for field in ("Amount", "TimeDiff", "SenderHistCount",
+                              "SenderHistAmountSum", "SenderHistAmountMean", "Time"):
+                    field_tensors[field] = (
+                        torch.from_numpy(processed[field].astype(float).values)
+                        .float().unsqueeze(1).to(device))
+                for field in ("Type", "Target"):
+                    raw = processed[field].astype(str)
+                    le = LabelEncoder()
+                    field_tensors[field] = (
+                        torch.from_numpy(le.fit_transform(raw)).long().unsqueeze(1).to(device))
+
+        model = RGTAN(**model_kwargs).to(device)
+        _load_rgtan_state(model, checkpoint.get("rgtan_state_dict", checkpoint.get("model")))
         model.eval()
 
+        # ── 评估 forward ──────────────────────────────────────────────
         def collect(loader, description):
             truths, scores = [], []
             with torch.no_grad():
@@ -240,16 +311,36 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
                     inputs, work_inputs, neigh_inputs, batch_labels, lpa_labels = load_lpa_subtensor(
                         num_feat, cat_feat, nei_feat, {}, label_tensor, seeds, input_nodes, device,
                         blocks, known_labels)
-                    embedding = None
-                    if ca1 is not None:
+                    blocks_gpu = [block.to(device) for block in blocks]
+
+                    if method == "rgtan_mpfc":
                         cpu_nodes = input_nodes.detach().cpu().long()
-                        embedding, _, _ = ca1(
+                        ca1_emb, _, _ = ca1(
                             ca1_sequence[cpu_nodes].to(device), ca1_len[cpu_nodes].to(device),
                             ca1_mask[cpu_nodes].to(device))
-                        if len(embedding) != blocks[0].num_src_nodes():
-                            raise RuntimeError("CA1 embedding and first-block input nodes are misaligned")
-                    logits = model([block.to(device) for block in blocks], inputs, lpa_labels,
-                                   work_inputs, neigh_inputs, ca1_embedding=embedding)
+                        ca3_out = ca3(ca1_emb, enabled=True)
+                        class_logits, hidden = model(
+                            blocks_gpu, inputs, lpa_labels, work_inputs, neigh_inputs,
+                            ca1_embedding=ca3_out.enhanced_embedding, return_hidden=True)
+                        neural_logit = binary_logits_to_risk_logit(class_logits)
+                        seed_idx = seeds.detach().cpu().long()
+                        rb = {n: t[seed_idx] for n, t in field_tensors.items()}
+                        rule_score, rule_confidence = rule_engine.evaluate(rb)
+                        mpfc_out = mpfc(hidden, neural_logit, rule_score, rule_confidence)
+                        logits = torch.cat(
+                            [-mpfc_out.final_logit, mpfc_out.final_logit], dim=1)
+                    else:
+                        embedding = None
+                        if ca1 is not None:
+                            cpu_nodes = input_nodes.detach().cpu().long()
+                            embedding, _, _ = ca1(
+                                ca1_sequence[cpu_nodes].to(device), ca1_len[cpu_nodes].to(device),
+                                ca1_mask[cpu_nodes].to(device))
+                            if len(embedding) != blocks[0].num_src_nodes():
+                                raise RuntimeError("CA1 embedding misaligned")
+                        logits = model(blocks_gpu, inputs, lpa_labels, work_inputs, neigh_inputs,
+                                       ca1_embedding=embedding)
+
                     valid = batch_labels != 2
                     probabilities = torch.softmax(logits[valid], dim=1)[:, 1]
                     truths.extend(batch_labels[valid].cpu().tolist())
@@ -281,7 +372,9 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             "duration_seconds": training_seconds + finalization_seconds,
             "finalization_seconds": finalization_seconds,
             "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
-            "ca1_enabled": method == "rgtan_ca1", "ca3_enabled": False,
+            "ca1_enabled": method in ("rgtan_ca1", "rgtan_mpfc"),
+            "ca3_enabled": method == "rgtan_mpfc",
+            "mpfc_enabled": method == "rgtan_mpfc",
         }
         metadata = {
             **final, "run_dir": str(run_dir), "train_mode": "single_split",
@@ -316,7 +409,9 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             "auc": final["test_auc"], "ap": final["test_ap"], "f1": final["test_f1"],
             "best_epoch": best_epoch, "best_val_loss": best_val_loss,
             "duration_seconds": final["duration_seconds"],
-            "ca1_enabled": method == "rgtan_ca1", "ca3_enabled": False,
+            "ca1_enabled": method in ("rgtan_ca1", "rgtan_mpfc"),
+            "ca3_enabled": method == "rgtan_mpfc",
+            "mpfc_enabled": method == "rgtan_mpfc",
             "run_dir": str(run_dir), "created_at": started_at, "status": "success",
         })
         print(json.dumps(final, ensure_ascii=False, indent=2))

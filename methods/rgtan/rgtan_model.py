@@ -463,6 +463,7 @@ class RGTAN(nn.Module):
         self.n_layers = n_layers
         self.n_classes = n_classes
         self.heads = heads  # [4,4,4]
+        self.classification_input_dim = self.hidden_dim * self.heads[-1]
         self.activation = activation  # PRelu
         self.use_ca1 = ca1_hidden_dim is not None
         if self.use_ca1:
@@ -516,18 +517,17 @@ class RGTAN(nn.Module):
                                                layer_norm=layer_norm,
                                                activation=self.activation))
         if post_proc:
-            self.layers.append(nn.Sequential(nn.Linear(self.hidden_dim * self.heads[-1], self.hidden_dim * self.heads[-1]),
+            self.layers.append(nn.Sequential(nn.Linear(self.classification_input_dim, self.classification_input_dim),
                                              nn.BatchNorm1d(
-                                                 self.hidden_dim * self.heads[-1]),
+                                                 self.classification_input_dim),
                                              nn.PReLU(),
                                              nn.Dropout(self.drop),
-                                             nn.Linear(self.hidden_dim * self.heads[-1], self.n_classes)))
+                                             nn.Linear(self.classification_input_dim, self.n_classes)))
         else:
-            self.layers.append(nn.Linear(self.hidden_dim *
-                               self.heads[-1], self.n_classes))
+            self.layers.append(nn.Linear(self.classification_input_dim, self.n_classes))
 
     def forward(self, blocks, features, labels, n2v_feat=None, neighstat_feat=None,
-                ca1_embedding=None):
+                ca1_embedding=None, return_hidden=False):
         """
         :param blocks: train blocks
         :param features: train features
@@ -563,4 +563,6 @@ class RGTAN(nn.Module):
 
         logits = self.layers[-1](h)
 
+        if return_hidden:
+            return logits, h
         return logits
