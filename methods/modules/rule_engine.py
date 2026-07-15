@@ -119,32 +119,19 @@ class RuleEngine:
     def evaluate(
         self,
         batch: Dict[str, torch.Tensor],
+        _cpu: bool = True,  # avoid NVRTC JIT on new GPU archs (PyTorch 1.12 compat)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """批量评估规则。
-
-        Parameters
-        ----------
-        batch:
-            字段名 → [batch_size] 或 [batch_size, 1] 的 tensor。
-            数值字段直接传入；
-            分类字段（Type、Target）需传入 label-encoded 整数 ID。
-
-        Returns
-        -------
-        rule_score:      [batch_size, 1]  ∈ [0, 1]
-        rule_confidence: [batch_size, 1]  ∈ [0, 1]
-        """
         if not self._rules:
             b = self._batch_size(batch)
             return (torch.zeros(b, 1, device=self.device),
                     torch.zeros(b, 1, device=self.device))
 
+        # Work on CPU to avoid NVRTC JIT compilation issues with torch.prod
+        # on newer GPU architectures (Ada Lovelace / Hopper) under PyTorch 1.12.
+        batch = {k: v.cpu() for k, v in batch.items()} if _cpu else batch
         n = self._batch_size(batch)
-        # hit_mat: [batch_size, n_rules]  — 每条规则是否命中
-        hit_mat = torch.ones(n, len(self._rules), dtype=torch.bool,
-                             device=self.device)
+        hit_mat = torch.ones(n, len(self._rules), dtype=torch.bool)
 
-        # 按规则索引分组填充
         for ridx in range(len(self._rules)):
             clause_indices = self._rule_boundaries.get(
                 self._rules[ridx].rule_id, []
@@ -160,13 +147,15 @@ class RuleEngine:
                 )
             if op == "AND":
                 combined = torch.stack(clause_results, dim=1).all(dim=1)
-            else:  # OR
+            else:
                 combined = torch.stack(clause_results, dim=1).any(dim=1)
             hit_mat[:, ridx] = combined
 
-        # 聚合
         rule_score = self._aggregate_scores(hit_mat)
         rule_confidence = self._aggregate_confidence(hit_mat)
+        if _cpu and self.device.type != "cpu":
+            rule_score = rule_score.to(self.device)
+            rule_confidence = rule_confidence.to(self.device)
         return rule_score, rule_confidence
 
     # ── 内部方法 ────────────────────────────────────────────────────────
