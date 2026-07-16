@@ -29,6 +29,7 @@ from methods.modules.ca3 import CA3PrototypeMemory
 from methods.modules.mpfc import MPFCDecisionFusion, binary_logits_to_risk_logit
 from methods.modules.rule_engine import RuleEngine
 from methods.modules.rule_bank import RuleBank
+from methods.modules.vta import VTAModule
 from methods.rgtan.evaluation import best_macro_f1_threshold
 from methods.rgtan.rgtan_lpa import load_lpa_subtensor
 from methods.rgtan.rgtan_main import (
@@ -224,7 +225,7 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             nei_att_head=args["nei_att_heads"]["aml"],
         )
         # ── 模型加载（按 method 分支） ──────────────────────────────────
-        ca1, ca3, mpfc, rule_engine, field_tensors = None, None, None, None, None
+        ca1, ca3, mpfc, rule_engine, field_tensors, vta = None, None, None, None, None, None
         needs_ca1 = method in ("rgtan_ca1", "rgtan_mpfc")
         model_kwargs = dict(
             in_feats=feat_df.shape[1], hidden_dim=args["hid_dim"] // 4, n_classes=2,
@@ -299,6 +300,31 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
                     field_tensors[field] = (
                         torch.from_numpy(le.fit_transform(raw)).long().unsqueeze(1).to(device))
 
+                # VTA (if checkpoint contains VTA state)
+                use_vta = bool(args.get("use_vta", False))
+                vta = None
+                if use_vta and checkpoint.get("vta_state_dict") is not None:
+                    vta = VTAModule(
+                        use_vta=True,
+                        num_prototypes=args["ca3_num_prototypes"],
+                        lambda_fn=args.get("vta_lambda_fn", 5.0),
+                        lambda_fp=args.get("vta_lambda_fp", 1.0),
+                        prediction_weight=args.get("vta_prediction_weight", 1.0),
+                        conflict_weight=args.get("vta_conflict_weight", 0.3),
+                        entropy_weight=args.get("vta_entropy_weight", 0.3),
+                        reweight_strength=args.get("vta_reweight_strength", 1.0),
+                        reweight_max=args.get("vta_reweight_max", 8.0),
+                        ema_decay=args.get("vta_ema_decay", 0.9),
+                        state_temperature=args.get("vta_state_temperature", 1.0),
+                        gate_strength=args.get("vta_gate_strength", 0.1),
+                        gate_bias_max=args.get("vta_gate_bias_max", 0.5),
+                        ca3_strength=args.get("vta_ca3_strength", 0.5),
+                        ca3_scale_min=args.get("vta_ca3_scale_min", 0.5),
+                        ca3_scale_max=args.get("vta_ca3_scale_max", 2.0),
+                    ).to(device)
+                    vta.load_state_dict(checkpoint["vta_state_dict"])
+                    vta.eval()
+
         model = RGTAN(**model_kwargs).to(device)
         _load_rgtan_state(model, checkpoint.get("rgtan_state_dict", checkpoint.get("model")))
         model.eval()
@@ -326,7 +352,9 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
                         seed_idx = seeds.detach().cpu().long()
                         rb = {n: t[seed_idx] for n, t in field_tensors.items()}
                         rule_score, rule_confidence = rule_engine.evaluate(rb)
-                        mpfc_out = mpfc(hidden, neural_logit, rule_score, rule_confidence)
+                        gate_offset = vta.get_gate_bias_offset() if vta is not None else None
+                        mpfc_out = mpfc(hidden, neural_logit, rule_score, rule_confidence,
+                                         gate_bias_offset=gate_offset)
                         logits = torch.cat(
                             [-mpfc_out.final_logit, mpfc_out.final_logit], dim=1)
                     else:
@@ -375,6 +403,7 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             "ca1_enabled": method in ("rgtan_ca1", "rgtan_mpfc"),
             "ca3_enabled": method == "rgtan_mpfc",
             "mpfc_enabled": method == "rgtan_mpfc",
+            "vta_enabled": vta is not None,
         }
         metadata = {
             **final, "run_dir": str(run_dir), "train_mode": "single_split",
@@ -412,6 +441,7 @@ def finalize_run(run_or_checkpoint, method_override=None, device_override=None, 
             "ca1_enabled": method in ("rgtan_ca1", "rgtan_mpfc"),
             "ca3_enabled": method == "rgtan_mpfc",
             "mpfc_enabled": method == "rgtan_mpfc",
+            "vta_enabled": vta is not None,
             "run_dir": str(run_dir), "created_at": started_at, "status": "success",
         })
         print(json.dumps(final, ensure_ascii=False, indent=2))

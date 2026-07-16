@@ -1873,6 +1873,7 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
     scheduler.load_state_dict(best_state["scheduler_state_dict"])
 
     ca3_enabled = True; mpfc.eval(); vta.eval()
+    val_eval = evaluate(val_loader, "best checkpoint val")
     threshold, val_f1 = best_macro_f1_threshold(val_eval[1], val_eval[2])
 
     model.eval(); ca1.eval(); ca3.eval()

@@ -15,6 +15,7 @@ def _make_input(batch=8, entropy_val=None):
     """Create a realistic VTAInput for testing."""
     dev = torch.device("cpu")
     final_logit = torch.randn(batch, 1, device=dev) * 0.5
+    final_logit.requires_grad_()  # for gradient test
     final_prob = torch.sigmoid(final_logit)
     neural_score = torch.sigmoid(torch.randn(batch, 1, device=dev))
     rule_score = torch.sigmoid(torch.randn(batch, 1, device=dev))
