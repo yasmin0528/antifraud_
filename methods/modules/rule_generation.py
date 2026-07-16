@@ -318,6 +318,7 @@ def generate_rulebank(
     # 5. 决定规则来源
     if report.get("valid"):
         rules = report["rules"]
+        rules = _resolve_rule_values(rules, _build_value_ref_map(stats))
         generation_log = {
             "source": "llm",
             "llm_raw_output": raw_text,
@@ -408,6 +409,7 @@ def _few_shot_examples() -> str:
 
 
 def _build_ref_keys(stats: DatasetStatistics) -> set:
+    """返回合法的统计引用键集合（用于 LLM 输出校验）。"""
     keys = set()
     for field, groups in stats.numerical.items():
         for group_name, values in groups.items():
@@ -419,6 +421,30 @@ def _build_ref_keys(stats: DatasetStatistics) -> set:
                 elif k.startswith("p"):
                     keys.add(f"{field}_{group_name}_{k}")
     return keys
+
+
+def _build_value_ref_map(stats: DatasetStatistics) -> dict:
+    """返回 {value_ref_key: actual_value} 映射（用于解析 LLM 规则的 value_ref 到真实值）。"""
+    mapping = {}
+    for field, groups in stats.numerical.items():
+        for group_name, values in groups.items():
+            if not isinstance(values, dict):
+                continue
+            for k, v in values.items():
+                ref = f"{field}_{group_name}_{k}"
+                if isinstance(v, (int, float)):
+                    mapping[ref] = v
+    return mapping
+
+
+def _resolve_rule_values(rules: list, ref_map: dict) -> list:
+    """将规则中的 value_ref 替换为实际统计值填入 value 字段。"""
+    for rule in rules:
+        for clause in rule.clauses:
+            vref = clause.get("value_ref")
+            if vref and vref in ref_map and clause.get("value") is None:
+                clause["value"] = ref_map[vref]
+    return rules
 
 
 def _build_fallback_rules(ref_keys: set) -> List[Rule]:
