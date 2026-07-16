@@ -49,10 +49,10 @@ def main():
     parser.add_argument("--prompt", default="prompts/rule_generation_v1.txt")
     parser.add_argument("--api-url", default="http://localhost:23333/v1/chat/completions")
     parser.add_argument("--model", default="qwen")
-    parser.add_argument("--max-rules", type=int, default=20)
+    parser.add_argument("--max-rules", type=int, default=25)
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--max-tokens", type=int, default=8192)
+    parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--force", action="store_true", help="Overwrite existing YAML")
     args = parser.parse_args()
 
@@ -84,7 +84,7 @@ def main():
         data_fingerprint=data_fingerprint,
         prompt_fingerprint=prompt_fingerprint,
         prompt_version="1.0",
-        max_rules=50,
+        max_rules=args.max_rules,
         max_final_rules=12,
         vllm_params={
             "temperature": args.temperature,
