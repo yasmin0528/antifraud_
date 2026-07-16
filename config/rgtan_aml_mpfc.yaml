@@ -70,3 +70,23 @@ vllm_top_p: 0.95
 results_dir: results
 nei_att_heads:
   aml: 1
+
+# VTA 全局学习调节
+use_vta: false
+vta_lambda_fn: 5.0
+vta_lambda_fp: 1.0
+vta_prediction_weight: 1.0
+vta_conflict_weight: 0.3
+vta_entropy_weight: 0.3
+vta_reweight_strength: 1.0
+vta_reweight_max: 8.0
+vta_ema_decay: 0.9
+vta_state_temperature: 1.0
+vta_enable_gate_feedback: true
+vta_gate_strength: 0.1
+vta_gate_bias_max: 0.5
+vta_enable_ca3_feedback: true
+vta_ca3_strength: 0.5
+vta_ca3_scale_min: 0.5
+vta_ca3_scale_max: 2.0
+vta_enable_review: true

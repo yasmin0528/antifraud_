@@ -124,3 +124,4 @@ venv.bak/
 .mypy_cache/
 data/*.zip
 results/
+config/rulebank/

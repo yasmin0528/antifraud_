@@ -9,6 +9,7 @@ from .rule_generation import (
     generate_rulebank,
     load_or_generate_rulebank,
 )
+from .vta import VTAModule, VTAInput, VTAOutput
 
 __all__ = [
     "CA1Encoder",
@@ -31,4 +32,8 @@ __all__ = [
     "QwenRuleGenerator",
     "generate_rulebank",
     "load_or_generate_rulebank",
+    # VTA
+    "VTAModule",
+    "VTAInput",
+    "VTAOutput",
 ]

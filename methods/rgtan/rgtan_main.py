@@ -13,6 +13,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import dgl
 import yaml
@@ -33,6 +34,7 @@ from feature_engineering.ca1_cache import load_or_build_aml_ca1_cache
 from methods.modules.ca1 import CA1Encoder
 from methods.modules.ca3 import CA3PrototypeMemory
 from methods.modules.mpfc import MPFCDecisionFusion, binary_logits_to_risk_logit, MPFCOutput
+from methods.modules.vta import VTAModule, VTAInput
 from methods.modules.rule_engine import RuleEngine
 from methods.modules.rule_generation import (
     load_or_generate_rulebank, QwenRuleGenerator, compute_training_statistics,
@@ -378,7 +380,8 @@ def _update_experiment_index(results_dir, row):
     columns = [
         "run_id", "method", "dataset", "seed", "auc", "ap", "f1", "best_epoch",
         "best_val_loss", "duration_seconds", "ca1_enabled", "ca3_enabled", "mpfc_enabled",
-        "ca3_num_prototypes", "ca3_warmup_epochs", "run_dir", "created_at", "status",
+        "vta_enabled", "ca3_num_prototypes", "ca3_warmup_epochs",
+        "run_dir", "created_at", "status",
     ]
     path = os.path.join(results_dir, "experiment_index.csv")
     current = pd.read_csv(path) if os.path.exists(path) else pd.DataFrame()
@@ -1542,6 +1545,27 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
         confidence_constrained=args.get("mpfc_confidence_constrained", True),
     ).to(device)
 
+    # VTA 全局学习调节
+    use_vta = bool(args.get("use_vta", False))
+    vta = VTAModule(
+        use_vta=use_vta,
+        num_prototypes=args["ca3_num_prototypes"],
+        lambda_fn=args.get("vta_lambda_fn", 5.0),
+        lambda_fp=args.get("vta_lambda_fp", 1.0),
+        prediction_weight=args.get("vta_prediction_weight", 1.0),
+        conflict_weight=args.get("vta_conflict_weight", 0.3),
+        entropy_weight=args.get("vta_entropy_weight", 0.3),
+        reweight_strength=args.get("vta_reweight_strength", 1.0),
+        reweight_max=args.get("vta_reweight_max", 8.0),
+        ema_decay=args.get("vta_ema_decay", 0.9),
+        state_temperature=args.get("vta_state_temperature", 1.0),
+        gate_strength=args.get("vta_gate_strength", 0.1),
+        gate_bias_max=args.get("vta_gate_bias_max", 0.5),
+        ca3_strength=args.get("vta_ca3_strength", 0.5),
+        ca3_scale_min=args.get("vta_ca3_scale_min", 0.5),
+        ca3_scale_max=args.get("vta_ca3_scale_max", 2.0),
+    ).to(device)
+
     optimizer = optim.Adam(
         list(model.parameters()) + list(ca1.parameters()) + list(ca3.parameters())
         + list(mpfc.parameters()),
@@ -1606,8 +1630,10 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
         }
         rule_score, rule_confidence = rule_engine.evaluate(rule_batch)
 
-        # MPFC fusion
-        mpfc_out = mpfc(hidden, neural_logit, rule_score, rule_confidence)
+        # MPFC fusion (with VTA gate bias offset from previous batch)
+        gate_offset = vta.get_gate_bias_offset()
+        mpfc_out = mpfc(hidden, neural_logit, rule_score, rule_confidence,
+                         gate_bias_offset=gate_offset if use_vta else None)
 
         return mpfc_out, class_logits, ca1_logit[local], ca1_score[local], \
                ca3_out, local, batch_labels, ca1_embedding, rule_score, rule_confidence
@@ -1630,8 +1656,11 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
             anneal_progress = max(0.0, min(1.0, (epoch - warmup) / anneal_epochs))
             ca3.set_anneal_progress(anneal_progress)
 
-        model.train(); ca1.train(); ca3.train(); mpfc.train()
+        model.train(); ca1.train(); ca3.train(); mpfc.train(); vta.train()
+        vta_keys = ["surprise", "pred_error", "conflict", "entropy",
+                    "sample_w", "dopamine", "gate_dir", "ca3_scale"]
         accum = {key: [] for key in ("main", "ca1", "contrastive", "div", "total", "gate")}
+        accum_vta = {key: [] for key in vta_keys}
         train_y, train_score, train_pred = [], [], []
         train_entropy, train_ids, train_gates, train_rule_scores = [], [], [], []
 
@@ -1644,16 +1673,38 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
             if not valid.any():
                 continue
 
-            # MPFC final logit loss（用 BCEWithLogitsLoss，因为 final_logit 是单维风险 logit）
-            mpfc_loss = binary_loss_fn(mpfc_out.final_logit[valid].squeeze(-1),
-                                        batch_labels[valid].float())
+            # ── VTA 前向（训练模式，含 label） ──────────────────────
+            ca3_entropy_batch = ca3_out.assignment_entropy[local][valid]
+            inp = VTAInput(
+                final_logit=mpfc_out.final_logit[valid],
+                final_prob=mpfc_out.score_mid[valid],
+                neural_score=mpfc_out.neural_score[valid],
+                rule_score=mpfc_out.rule_score[valid],
+                fusion_weight=mpfc_out.fusion_weight[valid],
+                ca3_entropy=ca3_entropy_batch,
+                label=batch_labels[valid],
+            )
+            vta_out = vta(inp, mode="train")
+
+            # ── 反馈路径一：逐样本加权主任务 BCE ──────────────────
+            per_sample_bce = F.binary_cross_entropy_with_logits(
+                mpfc_out.final_logit[valid].squeeze(-1),
+                batch_labels[valid].float(),
+                reduction="none",
+            )
+            weighted_bce = (vta_out.sample_weight * per_sample_bce).sum() / \
+                            vta_out.sample_weight.sum().clamp_min(1e-8)
+            mpfc_loss = weighted_bce
+
             # RGTAN auxiliary classifier loss（保持 RGTAN 特征相关性）
             rgtan_loss = main_loss_fn(class_logits[valid], batch_labels[valid])
             main_loss = mpfc_loss + rgtan_loss
             ca1_loss = binary_loss_fn(ca1_logit[valid].squeeze(-1), batch_labels[valid].float())
             if ca3_enabled:
-                contrastive = ca3.contrastive_loss(ca1_emb)
+                contrastive_raw = ca3.contrastive_loss(ca1_emb)
                 diversity = ca3.diversity_loss()
+                # 反馈路径三：调节 CA3 contrastive loss
+                contrastive = vta_out.ca3_learning_signal * contrastive_raw
             else:
                 contrastive = main_loss.new_zeros(())
                 diversity = main_loss.new_zeros(())
@@ -1669,6 +1720,18 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                                   (main_loss, ca1_loss, contrastive, diversity, total,
                                    mpfc_out.fusion_weight.mean())):
                 accum[key].append(value.item())
+            vta_values = [
+                vta_out.surprise.mean().item(),
+                vta_out.prediction_error.mean().item(),
+                vta_out.conflict.mean().item(),
+                vta_out.entropy.mean().item(),
+                vta_out.sample_weight.mean().item(),
+                vta_out.dopamine_state.item(),
+                vta_out.gate_direction_state.item(),
+                vta_out.ca3_learning_signal.item(),
+            ]
+            for key, value in zip(vta_keys, vta_values):
+                accum_vta[key].append(value)
 
             probs = torch.softmax(class_logits[valid].detach(), dim=1)[:, 1]
             train_y += batch_labels[valid].cpu().tolist()
@@ -1731,6 +1794,17 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
         for prefix, values in (("train", train_metrics), ("val", val_metrics)):
             for name, value in values.items():
                 row[f"{prefix}_{name}"] = value
+        # VTA 训练指标
+        if use_vta and accum_vta.get("surprise"):
+            vta_row = {}
+            for vk in vta_keys:
+                vta_row[f"train_vta_{vk}"] = float(np.mean(accum_vta[vk]))
+            row.update(vta_row)
+        else:
+            for vk in vta_keys:
+                row[f"train_vta_{vk}"] = np.nan
+        row["train_vta_gate_bias"] = float(vta.get_gate_bias_offset().item())
+
         row.update({
             "train_assignment_entropy": float(np.mean(train_entropy)) if train_entropy else np.nan,
             "val_assignment_entropy": float(np.mean(val_entropy)) if val_entropy else np.nan,
@@ -1759,6 +1833,7 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                 "ca1_state_dict": copy.deepcopy(ca1.state_dict()),
                 "ca3_state_dict": copy.deepcopy(ca3.state_dict()),
                 "mpfc_state_dict": copy.deepcopy(mpfc.state_dict()),
+                "vta_state_dict": copy.deepcopy(vta.state_dict()) if use_vta else None,
                 "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
                 "scheduler_state_dict": copy.deepcopy(scheduler.state_dict()),
                 "best_epoch": epoch + 1, "best_val_metric": val_main,
@@ -1792,11 +1867,12 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
     ca1.load_state_dict(best_state["ca1_state_dict"])
     ca3.load_state_dict(best_state["ca3_state_dict"])
     mpfc.load_state_dict(best_state["mpfc_state_dict"])
+    if use_vta and best_state.get("vta_state_dict") is not None:
+        vta.load_state_dict(best_state["vta_state_dict"])
     optimizer.load_state_dict(best_state["optimizer_state_dict"])
     scheduler.load_state_dict(best_state["scheduler_state_dict"])
 
-    ca3_enabled = True; mpfc.eval()
-    val_eval = evaluate(val_loader, "best checkpoint val")
+    ca3_enabled = True; mpfc.eval(); vta.eval()
     threshold, val_f1 = best_macro_f1_threshold(val_eval[1], val_eval[2])
 
     model.eval(); ca1.eval(); ca3.eval()
@@ -1812,8 +1888,27 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
             score = mpfc_out.score_mid[valid].squeeze(-1)
             test_y += batch_labels[valid].cpu().tolist()
             test_scores += score.cpu().tolist()
+
+            # VTA 推理模式
+            if use_vta:
+                vta_eval_inp = VTAInput(
+                    final_logit=mpfc_out.final_logit[valid],
+                    final_prob=mpfc_out.score_mid[valid],
+                    neural_score=mpfc_out.neural_score[valid],
+                    rule_score=mpfc_out.rule_score[valid],
+                    fusion_weight=mpfc_out.fusion_weight[valid],
+                    ca3_entropy=out.assignment_entropy[local][valid],
+                    label=None,
+                )
+                vta_eval_out = vta(vta_eval_inp, mode="eval")
+                vta_uncertainty = vta_eval_out.uncertainty
+                vta_review = vta_eval_out.review_score
+            else:
+                vta_uncertainty = torch.zeros(valid.sum(), device=device)
+                vta_review = torch.zeros(valid.sum(), device=device)
+
             for j, node_id in enumerate(seed_ids):
-                assignments.append({
+                entry = {
                     "TX_ID": args["_aml_sample_ids"][node_id],
                     "label": int(batch_labels[valid][j].item()),
                     "rgtan_score": float(score[j].item()),
@@ -1827,8 +1922,11 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                     "top_proto_sim": float(out.top_proto_sim[local][valid][j].item()),
                     "assignment_entropy": float(out.assignment_entropy[local][valid][j].item()),
                     "gate": float(out.gate_probs[local][valid][j].item()),
+                    "vta_uncertainty": float(vta_uncertainty[j].item()),
+                    "vta_review_score": float(vta_review[j].item()),
                     "node_id": node_id,
-                })
+                }
+                assignments.append(entry)
 
     test_preds = (np.asarray(test_scores) >= threshold).astype(int)
     test_metric = _classification_metrics(test_y, test_scores, test_preds)
@@ -1851,7 +1949,7 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
         "best_epoch": best_state["best_epoch"], "best_val_loss": best_loss,
         "duration_seconds": (datetime.now().astimezone() - started_dt).total_seconds(),
         "train_size": len(train_idx), "val_size": len(val_idx), "test_size": len(test_idx),
-        "ca1_enabled": True, "ca3_enabled": True, "mpfc_enabled": True,
+        "ca1_enabled": True, "ca3_enabled": True, "mpfc_enabled": True, "vta_enabled": use_vta,
         "ca3_num_prototypes": args["ca3_num_prototypes"],
         "ca3_warmup_epochs": warmup,
         "rulebank_path": rulebank_path,
@@ -1903,6 +2001,20 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
         "label_propagation_scope": "train_only",
         "amount_normalization_scope": "train_split",
         "graph_feature_setting": "transductive_features_train_labels_only",
+        "vta_enabled": use_vta,
+        "vta_lambda_fn": args.get("vta_lambda_fn", 5.0),
+        "vta_lambda_fp": args.get("vta_lambda_fp", 1.0),
+        "vta_prediction_weight": args.get("vta_prediction_weight", 1.0),
+        "vta_conflict_weight": args.get("vta_conflict_weight", 0.3),
+        "vta_entropy_weight": args.get("vta_entropy_weight", 0.3),
+        "vta_reweight_strength": args.get("vta_reweight_strength", 1.0),
+        "vta_reweight_max": args.get("vta_reweight_max", 8.0),
+        "vta_ema_decay": args.get("vta_ema_decay", 0.9),
+        "vta_gate_strength": args.get("vta_gate_strength", 0.1),
+        "vta_gate_bias_max": args.get("vta_gate_bias_max", 0.5),
+        "vta_ca3_strength": args.get("vta_ca3_strength", 0.5),
+        "vta_ca3_scale_min": args.get("vta_ca3_scale_min", 0.5),
+        "vta_ca3_scale_max": args.get("vta_ca3_scale_max", 2.0),
         "finished_at": datetime.now().astimezone().isoformat(),
     }
     with open(os.path.join(run_dir, "metadata.json"), "w", encoding="utf-8") as handle:

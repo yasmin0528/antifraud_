@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 import torch.nn as nn
@@ -49,7 +49,8 @@ class MPFCDecisionFusion(nn.Module):
         nn.init.constant_(self.gate_mlp[-1].bias, gate_bias_init)
 
     def forward(self, rgtan_hidden: torch.Tensor, neural_logit: torch.Tensor,
-                rule_score: torch.Tensor, rule_confidence: torch.Tensor) -> MPFCOutput:
+                rule_score: torch.Tensor, rule_confidence: torch.Tensor,
+                gate_bias_offset: Optional[torch.Tensor] = None) -> MPFCOutput:
         tensors = {
             "rgtan_hidden": rgtan_hidden,
             "neural_logit": neural_logit,
@@ -83,7 +84,10 @@ class MPFCDecisionFusion(nn.Module):
             raise ValueError("rule_confidence must be within [0, 1]")
 
         gate_input = torch.cat([rgtan_hidden, rule_score, rule_confidence], dim=-1)
-        gate = torch.sigmoid(self.gate_mlp(gate_input))
+        gate_logit = self.gate_mlp(gate_input)
+        if gate_bias_offset is not None:
+            gate_logit = gate_logit + gate_bias_offset
+        gate = torch.sigmoid(gate_logit)
         fusion_weight = rule_confidence * gate if self.confidence_constrained else gate
         rule_logit = torch.logit(rule_score.clamp(min=self.eps, max=1.0 - self.eps))
         final_logit = neural_logit + fusion_weight * (rule_logit - neural_logit)
