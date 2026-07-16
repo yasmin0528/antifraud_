@@ -111,15 +111,12 @@ def compute_training_statistics(
 def _percentile_stats(s: pd.Series) -> dict:
     if len(s) == 0:
         return {}
-    q = [0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99, 0.995]
+    q = [0.25, 0.50, 0.75, 0.95, 0.99]
     percentiles = s.quantile(q).to_dict()
     return {
         "count": int(s.count()),
         "mean": round(float(s.mean()), 4),
         "std": round(float(s.std()), 4),
-        "min": round(float(s.min()), 4),
-        "max": round(float(s.max()), 4),
-        "skew": round(float(s.skew()), 4),
         **{f"p{int(p*100)}".replace(".", "_"): round(float(v), 4)
            for p, v in zip(q, percentiles.values())},
     }
@@ -130,7 +127,7 @@ def _categorical_stats(s: pd.Series) -> list:
     total = len(s)
     return [
         {"value": str(val), "count": int(cnt), "ratio": round(cnt / total, 4)}
-        for val, cnt in vc.head(30).items()
+        for val, cnt in vc.head(10).items()
     ]
 
 
@@ -156,7 +153,7 @@ class QwenRuleGenerator:
         self,
         api_url: str = "http://localhost:23333/v1/chat/completions",
         model: str = "qwen",
-        timeout: int = 120,
+        timeout: int = 300,
     ):
         self.api_url = api_url
         self.model = model
@@ -286,7 +283,7 @@ def generate_rulebank(
     -------
     加载了最终规则的 RuleBank 实例（已写入 output_path）。
     """
-    vllm_params = vllm_params or {"temperature": 0.3, "max_tokens": 4096, "top_p": 0.95}
+    vllm_params = vllm_params or {"temperature": 0.3, "max_tokens": 8192, "top_p": 0.95}
 
     # 1. 读取 prompt 模板
     with open(prompt_path, "r", encoding="utf-8") as f:

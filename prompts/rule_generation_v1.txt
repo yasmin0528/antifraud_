@@ -1,36 +1,59 @@
 # Role
-你是 AML（反洗钱）风控规则专家。请根据训练集交易字段说明和统计摘要生成候选规则。
+你是 AML（反洗钱）风控规则专家。你的任务是分析训练集统计摘要中正常样本与风险样本的分布差异，生成能够有效区分二者的规则。
 
 # Task
-生成最多 {max_rules} 条结构化候选规则。每条规则必须引用训练集统计分位数作为阈值依据。
+生成最多 {max_rules} 条结构化候选规则。
+
+**核心方法：**
+- 逐一比较每个字段在 "normal" 与 "risk" 组之间的分布差异（p50、p75、p95、mean）
+- 找出 risk 组与 normal 组 **差异最大** 的字段组合
+- 优先使用**多条件（2-3个子句）组合规则**，而非单一条件
+- 规则应捕捉**多个维度的叠加异常**，而非单个字段的极端值
 
 # Business Context
-AML（Anti-Money Laundering）交易数据包含以下可疑模式：
-- Structuring（结构化交易）：将大额交易拆分为多笔小额以避免触发阈值
-- Rapid movement（快速流转）：资金在短时间内经过多个账户
-- Unusual frequency（异常频率）：账户突然出现大量交易
-- Amount spike（金额异常）：远高于该账户历史交易金额
-- Circular transactions（循环交易）：资金在多个账户间循环流转
+- Structuring（结构化交易）：将大额交易拆分为多笔小额以避免触发阈值——表现为金额不大但交易模式异常
+- Rapid movement（快速流转）：资金在短时间内经过多个账户——表现为 TimeDiff 短
+- Unusual frequency（异常频率）：账户突然出现大量交易——表现为 SenderHistCount 异常
+- Amount spike（金额异常）：远高于该账户历史交易金额——需结合 SenderHistAmountMean 判断
+- **注意：当前数据集中风险交易多为小额，核心区别在于行为模式而非金额大小**
 
 # Field Schema
 {field_schema_table}
 
-# Training Set Statistics
+# Training Set Statistics（包含 normal 与 risk 两组分组统计。请重点比较两组的差异。）
 {statistics_json}
 
 # Training Set Positive Rate: {positive_rate:.4f}
+
+# Data-driven Rule Design Guidance
+分析统计摘要后，请遵循以下策略选择规则条件：
+
+1. **找差异最大的字段**：比较每个字段 normal 组与 risk 组的 p50、p75、p95、mean。差异越大的字段越有区分力。例如：
+   - 如果 `Amount` 的 risk.p50 << normal.p50，说明风险交易金额偏低——应使用 `<` 而非 `>`
+   - 如果 `TimeDiff` 的 risk.p50 >> normal.p50，说明风险交易间隔更长——应使用 `>` 而非 `<`
+   - 如果 `SenderHistCount` 的 risk.p50 < normal.p50，说明风险账户历史交易更少
+
+2. **组合优于单一**：单字段规则区分力有限。请设计 **2-3 个条件的 AND 组合**，规则效果远好于单条件。
+
+3. **阈值选择策略**：
+   - 对于 risk 组**偏高**的字段：阈值选在 normal 组的 p75–p95之间
+   - 对于 risk 组**偏低**的字段：阈值选在 normal 组的 p5–p25之间
+   - 避免使用 p99（极端值容易被噪声主导）
+
+4. **业务可解释性**：每条规则的业务解释必须说明"风险交易与正常交易在该字段组合下的行为差异"，而非笼统说"可能为异常交易"。
 
 # Constraints (MANDATORY)
 1. 仅使用以下字段作为条件：{allowed_fields_display}
 2. 仅使用以下操作符：>, <, >=, <=, ==, between, in, not_in
 3. 阈值必须引用训练集统计摘要中的标量键（格式: "FieldName_group_key"，如 "Amount_all_p99"、"TimeDiff_all_p5"），或为业务可解释的标量常数
 4. 禁止将 IS_FRAUD, Labels, AlertID, TX_ID, Source, SenderPrevFraudCount 作为条件
-5. 每条规则必须提供 business_explanation（业务解释）
+5. 每条规则必须提供 business_explanation（业务解释，必须说明正常与风险样本的分布差异）
 6. risk_score ∈ [0.0, 1.0]，base_confidence ∈ [0.0, 1.0]
 7. 对 Type 和 Target 字段的条件，必须使用原始字符串值（如 "TRANSFER"），而非数值编码
 8. 输出必须是严格符合 JSON Schema 的结构化 JSON
 9. 字段名大小写敏感（Amount 不是 amount）
 10. Rule ID 从 R001 开始编号
+11. **每条规则至少包含 2 个条件子句**（单一字段规则的区分力不足以通过评估）
 
 # Few-shot Examples
 {few_shot_examples}
@@ -43,17 +66,18 @@ AML（Anti-Money Laundering）交易数据包含以下可疑模式：
       "rule_id": "R001",
       "name": "your_rule_name",
       "category": "amount|velocity|frequency|pattern|network|temporal|behavioral|composite",
-      "description": "简短规则说明",
+      "description": "简短说明规则捕捉的行为模式",
       "conditions": {{
         "operator": "AND",
         "clauses": [
-          {{"field": "Amount", "operator": ">", "value_ref": "Amount_all_p99", "description": "说明"}}
+          {{"field": "TimeDiff", "operator": ">", "value_ref": "TimeDiff_risk_p50", "description": "风险样本的中位TimeDiff高于正常样本"}},
+          {{"field": "SenderHistCount", "operator": "<", "value_ref": "SenderHistCount_normal_p25", "description": "历史交易笔数低于正常样本的25分位"}}
         ]
       }},
-      "risk_score": 0.6,
-      "base_confidence": 0.5,
-      "business_explanation": "业务解释",
-      "limitations": "局限性说明（可选）"
+      "risk_score": 0.65,
+      "base_confidence": 0.55,
+      "business_explanation": "该规则捕捉的行为：风险交易的间隔更长（非快速转账）且账户历史交易更少（新账户特征），结合这两点可识别出使用新账户进行结构化交易的模式",
+      "limitations": "可能将新开户的正常用户误报"
     }}
   ]
 }}

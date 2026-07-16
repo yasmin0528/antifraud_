@@ -1644,8 +1644,12 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
             if not valid.any():
                 continue
 
-            # MPFC final logit loss
-            main_loss = main_loss_fn(class_logits[valid], batch_labels[valid])
+            # MPFC final logit loss（用 BCEWithLogitsLoss，因为 final_logit 是单维风险 logit）
+            mpfc_loss = binary_loss_fn(mpfc_out.final_logit[valid].squeeze(-1),
+                                        batch_labels[valid].float())
+            # RGTAN auxiliary classifier loss（保持 RGTAN 特征相关性）
+            rgtan_loss = main_loss_fn(class_logits[valid], batch_labels[valid])
+            main_loss = mpfc_loss + rgtan_loss
             ca1_loss = binary_loss_fn(ca1_logit[valid].squeeze(-1), batch_labels[valid].float())
             if ca3_enabled:
                 contrastive = ca3.contrastive_loss(ca1_emb)
@@ -1688,7 +1692,9 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                     valid = batch_labels != 2
                     if not valid.any():
                         continue
-                    ml = main_loss_fn(class_logits[valid], batch_labels[valid])
+                    ml = binary_loss_fn(mpfc_out.final_logit[valid].squeeze(-1),
+                                         batch_labels[valid].float()) + \
+                          main_loss_fn(class_logits[valid], batch_labels[valid])
                     c1 = binary_loss_fn(ca1_logit[valid].squeeze(-1), batch_labels[valid].float())
                     contrastive = (ca3.contrastive_loss(ca1_emb) if ca3_enabled else ml.new_zeros(()))
                     div = ca3.diversity_loss() if ca3_enabled else ml.new_zeros(())
@@ -1698,7 +1704,7 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                     for key, value in zip(result, (ml, c1, contrastive, div, total,
                                                    mpfc_out.fusion_weight.mean())):
                         result[key].append(value.item())
-                    prob = torch.softmax(class_logits[valid], dim=1)[:, 1]
+                    prob = mpfc_out.score_mid[valid].squeeze(-1)
                     ys += batch_labels[valid].cpu().tolist()
                     scores += prob.cpu().tolist()
                     preds += (prob >= 0.5).long().cpu().tolist()
@@ -1803,7 +1809,7 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                 rule_score, rule_confidence = forward_batch(input_nodes, seeds, blocks, True)
             valid = batch_labels != 2
             seed_ids = seeds[valid].detach().cpu().tolist()
-            score = torch.softmax(class_logits[valid], dim=1)[:, 1]
+            score = mpfc_out.score_mid[valid].squeeze(-1)
             test_y += batch_labels[valid].cpu().tolist()
             test_scores += score.cpu().tolist()
             for j, node_id in enumerate(seed_ids):

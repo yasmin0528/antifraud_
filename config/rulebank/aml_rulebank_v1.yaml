@@ -1,0 +1,273 @@
+format_version: '1.0'
+generated_at: '2026-07-16T01:59:34.232967+00:00'
+prompt_version: '1.0'
+prompt_fingerprint: 24f6d4656ff983e819ca5c69de4656da45f729e07a755796b9f953cf5e7e3b18
+data_fingerprint: fa3d1d26c213875290169926d837ad611302d92b4240695fb56c408f38edf189
+source_model: Qwen
+source_model_fingerprint: ''
+vllm_endpoint: http://localhost:23333/v1/chat/completions
+train_size: 585644
+positive_rate: 0.0012908866137107185
+rulebank_version: v1.0.0
+generation_params:
+  temperature: 0.3
+  max_tokens: 8192
+  top_p: 0.95
+rules:
+- rule_id: R001
+  name: High_Amount_Rapid_Sequence
+  category: velocity
+  active: true
+  description: 高金额 + 极短时间间隔
+  tags:
+  - high_severity
+  risk_score: 0.75
+  base_confidence: 0.6
+  metadata:
+    business_explanation: 同一发送方短时间内高频大额交易，可能为结构化洗钱行为（structuring）
+    limitations: 合法的大额批量支付可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: Amount
+      operator: '>'
+      value_ref: Amount_all_p99
+      description: 金额超过训练集 99 分位
+      value: 9560818.145
+    - field: TimeDiff
+      operator: <
+      value_ref: TimeDiff_all_p5
+      description: 交易间隔小于训练集 5 分位
+      value: 0.0
+- rule_id: R002
+  name: Unusual_Frequency_Sender
+  category: frequency
+  active: true
+  description: 发送方异常频繁交易
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方短期内出现大量交易，可能为异常频率行为（unusual frequency）
+    limitations: 正常活跃用户可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p95
+      description: 发送方历史交易笔数超过训练集 95 分位
+      value: 298.0
+- rule_id: R003
+  name: Large_Amount_Sender_History
+  category: amount
+  active: true
+  description: 发送方历史交易金额异常大
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方历史交易金额异常大，可能为金额异常行为（amount spike）
+    limitations: 正常大额交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountSum
+      operator: '>'
+      value_ref: SenderHistAmountSum_all_p95
+      description: 发送方历史累计金额超过训练集 95 分位
+      value: 63277.2
+- rule_id: R004
+  name: High_Amount_Transfer
+  category: amount
+  active: true
+  description: 单笔交易金额异常高
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 单笔交易金额异常高，可能为金额异常行为（amount spike）
+    limitations: 正常大额交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: Amount
+      operator: '>'
+      value_ref: Amount_all_p95
+      description: 单笔交易金额超过训练集 95 分位
+      value: 585.34
+- rule_id: R005
+  name: Rapid_Movement_Target
+  category: velocity
+  active: true
+  description: 收款方快速流转
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 收款方短时间内快速流转，可能为快速流转行为（rapid movement）
+    limitations: 合法的快速支付可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: TimeDiff
+      operator: <
+      value_ref: TimeDiff_all_p5
+      description: 交易间隔小于训练集 5 分位
+      value: 0.0
+- rule_id: R006
+  name: Unusual_Frequency_Target
+  category: frequency
+  active: true
+  description: 收款方异常频繁交易
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 收款方短期内出现大量交易，可能为异常频率行为（unusual frequency）
+    limitations: 正常活跃用户可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p95
+      description: 收款方历史交易笔数超过训练集 95 分位
+      value: 298.0
+- rule_id: R007
+  name: Large_Amount_Target_History
+  category: amount
+  active: true
+  description: 收款方历史交易金额异常大
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 收款方历史交易金额异常大，可能为金额异常行为（amount spike）
+    limitations: 正常大额交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountSum
+      operator: '>'
+      value_ref: SenderHistAmountSum_all_p95
+      description: 收款方历史累计金额超过训练集 95 分位
+      value: 63277.2
+- rule_id: R009
+  name: High_Amount_Sender_History_Mean
+  category: amount
+  active: true
+  description: 发送方历史交易平均金额异常高
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方历史交易平均金额异常高，可能为金额异常行为（amount spike）
+    limitations: 正常大额交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountMean
+      operator: '>'
+      value_ref: SenderHistAmountMean_all_p95
+      description: 发送方历史平均金额超过训练集 95 分位
+      value: 583.85
+- rule_id: R010
+  name: High_Amount_Target_History_Mean
+  category: amount
+  active: true
+  description: 收款方历史交易平均金额异常高
+  tags:
+  - medium_severity
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 收款方历史交易平均金额异常高，可能为金额异常行为（amount spike）
+    limitations: 正常大额交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountMean
+      operator: '>'
+      value_ref: SenderHistAmountMean_all_p95
+      description: 收款方历史平均金额超过训练集 95 分位
+      value: 583.85

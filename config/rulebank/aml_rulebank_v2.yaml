@@ -1,0 +1,274 @@
+format_version: '1.0'
+generated_at: '2026-07-16T05:25:18.489218+00:00'
+prompt_version: '1.0'
+prompt_fingerprint: 24f6d4656ff983e819ca5c69de4656da45f729e07a755796b9f953cf5e7e3b18
+data_fingerprint: fa3d1d26c213875290169926d837ad611302d92b4240695fb56c408f38edf189
+source_model: Qwen
+source_model_fingerprint: ''
+vllm_endpoint: http://localhost:23333/v1/chat/completions
+train_size: 585644
+positive_rate: 0.0012908866137107185
+rulebank_version: v2.0.0
+generation_params:
+  temperature: 0.3
+  max_tokens: 8192
+  top_p: 0.95
+rules:
+- rule_id: R001
+  name: High_Amount_Transfer
+  category: amount
+  active: true
+  description: 大额转账交易
+  tags: []
+  risk_score: 0.7
+  base_confidence: 0.6
+  metadata:
+    business_explanation: 大额转账可能是可疑交易，尤其是金额远超正常范围时。
+    limitations: 合法的大额转账可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: Amount
+      operator: '>'
+      value_ref: Amount_all_p99
+      description: 交易金额超过所有交易 99 分位
+      value: 2061312.64
+- rule_id: R002
+  name: High_Sender_Hist_Amount_Mean
+  category: amount
+  active: true
+  description: 发送方历史平均金额异常
+  tags: []
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方历史平均金额异常高，可能是可疑交易。
+    limitations: 合法的高价值交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountMean
+      operator: '>'
+      value_ref: SenderHistAmountMean_all_p99
+      description: 发送方历史平均金额超过所有交易 99 分位
+      value: 289578.9654
+- rule_id: R003
+  name: High_Sender_Hist_Amount_Sum
+  category: amount
+  active: true
+  description: 发送方历史累计金额异常
+  tags: []
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方历史累计金额异常高，可能是可疑交易。
+    limitations: 合法的高价值交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountSum
+      operator: '>'
+      value_ref: SenderHistAmountSum_all_p99
+      description: 发送方历史累计金额超过所有交易 99 分位
+      value: 2557448.2834
+- rule_id: R004
+  name: High_Sender_Hist_Count
+  category: frequency
+  active: true
+  description: 发送方历史交易次数异常
+  tags: []
+  risk_score: 0.6
+  base_confidence: 0.5
+  metadata:
+    business_explanation: 发送方历史交易次数异常高，可能是可疑交易。
+    limitations: 合法的高频率交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p99
+      description: 发送方历史交易次数超过所有交易 99 分位
+      value: 479.0
+- rule_id: R006
+  name: Unusual_Frequency_Transfer
+  category: frequency
+  active: true
+  description: 异常频繁的转账交易
+  tags: []
+  risk_score: 0.6
+  base_confidence: 0.5
+  metadata:
+    business_explanation: 异常频繁的转账交易可能是可疑交易，特别是当涉及多个账户时。
+    limitations: 合法的高频率交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p95
+      description: 发送方历史交易次数超过所有交易 95 分位
+      value: 298.0
+- rule_id: R007
+  name: Large_Amount_Transfer
+  category: amount
+  active: true
+  description: 大额转账交易
+  tags: []
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 大额转账可能是可疑交易，尤其是金额远超正常范围时。
+    limitations: 合法的大额转账可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: Amount
+      operator: '>'
+      value_ref: Amount_all_p95
+      description: 交易金额超过所有交易 95 分位
+      value: 585.34
+- rule_id: R012
+  name: High_Sender_Hist_Amount_Mean_Unusual_Frequency
+  category: frequency
+  active: true
+  description: 发送方历史平均金额异常且异常频繁交易
+  tags: []
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方历史平均金额异常高且交易次数异常频繁，可能是可疑交易。
+    limitations: 合法的高频率交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountMean
+      operator: '>'
+      value_ref: SenderHistAmountMean_all_p99
+      description: 发送方历史平均金额超过所有交易 99 分位
+      value: 289578.9654
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p95
+      description: 发送方历史交易次数超过所有交易 95 分位
+      value: 298.0
+- rule_id: R013
+  name: High_Sender_Hist_Amount_Sum_Unusual_Frequency
+  category: frequency
+  active: true
+  description: 发送方历史累计金额异常且异常频繁交易
+  tags: []
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方历史累计金额异常高且交易次数异常频繁，可能是可疑交易。
+    limitations: 合法的高频率交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistAmountSum
+      operator: '>'
+      value_ref: SenderHistAmountSum_all_p99
+      description: 发送方历史累计金额超过所有交易 99 分位
+      value: 2557448.2834
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p95
+      description: 发送方历史交易次数超过所有交易 95 分位
+      value: 298.0
+- rule_id: R014
+  name: High_Sender_Hist_Count_Unusual_Frequency
+  category: frequency
+  active: true
+  description: 发送方历史交易次数异常且异常频繁交易
+  tags: []
+  risk_score: 0.65
+  base_confidence: 0.55
+  metadata:
+    business_explanation: 发送方历史交易次数异常高且交易次数异常频繁，可能是可疑交易。
+    limitations: 合法的高频率交易可能误报
+    generated_by: Qwen
+    prompt_version: ''
+    review_status: pending
+    approved_by: null
+    approved_at: null
+    reviewed_at: null
+    hit_count_train: null
+    precision_train: null
+  conditions:
+    operator: AND
+    clauses:
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p99
+      description: 发送方历史交易次数超过所有交易 99 分位
+      value: 479.0
+    - field: SenderHistCount
+      operator: '>'
+      value_ref: SenderHistCount_all_p95
+      description: 发送方历史交易次数超过所有交易 95 分位
+      value: 298.0
