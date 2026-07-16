@@ -1359,7 +1359,7 @@ def loda_rgtan_data(args):
             test_size=test_size,
             seed=args["seed"],
         )
-        if args.get("method") in {"rgtan", "rgtan_ca1", "rgtan_ca1_ca3", "rgtan_mpfc"}:
+        if args.get("method") in {"rgtan", "rgtan_ca1", "rgtan_ca1_ca3", "rgtan_mpfc", "rgtan_mpfc_vta"}:
             remaining_groups = processed.iloc[train_idx]["Source"].reset_index(drop=True)
             remaining_labels = processed.iloc[train_idx]["Labels"].reset_index(drop=True)
             relative_train, relative_val = _sender_account_train_test_split(
