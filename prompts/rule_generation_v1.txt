@@ -54,6 +54,7 @@
 9. 字段名大小写敏感（Amount 不是 amount）
 10. Rule ID 从 R001 开始编号
 11. **每条规则至少包含 2 个条件子句**（单一字段规则的区分力不足以通过评估）
+12. **注意：risk_score 和 base_confidence 仅作为语义先验**。系统在后续筛选阶段会根据训练集上的命中率、精确率和覆盖度重新计算这两个值，LLM 自评分数不会直接进入 MPFC 融合模块
 
 # Few-shot Examples
 {few_shot_examples}

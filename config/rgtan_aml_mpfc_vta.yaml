@@ -79,11 +79,11 @@ vta_reweight_max: 8.0
 vta_ema_decay: 0.9
 vta_state_temperature: 1.0
 vta_enable_gate_feedback: true
-vta_gate_strength: 0.1
+vta_gate_strength: 0.5
 vta_gate_bias_max: 0.5
 vta_enable_ca3_feedback: true
 vta_ca3_strength: 0.5
-vta_ca3_scale_min: 0.5
+vta_ca3_scale_min: 0.8
 vta_ca3_scale_max: 2.0
 vta_enable_review: true
 

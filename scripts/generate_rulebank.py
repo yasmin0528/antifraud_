@@ -74,15 +74,18 @@ def main():
     data_fingerprint = sha256_file(cli_args["_aml_processed_path"])
     prompt_fingerprint = sha256_file(args.prompt)
 
+    train_df = processed.iloc[train_idx]
     bank = generate_rulebank(
         stats=stats,
         prompt_path=args.prompt,
         output_path=args.output,
         llm_client=QwenRuleGenerator(api_url=args.api_url, model=args.model),
+        train_df=train_df,
         data_fingerprint=data_fingerprint,
         prompt_fingerprint=prompt_fingerprint,
         prompt_version="1.0",
-        max_rules=args.max_rules,
+        max_rules=50,
+        max_final_rules=12,
         vllm_params={
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,

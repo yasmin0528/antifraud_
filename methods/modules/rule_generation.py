@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -242,15 +243,17 @@ def generate_rulebank(
     prompt_path: str,
     output_path: str,
     llm_client: QwenRuleGenerator,
+    train_df: Optional[pd.DataFrame] = None,
     encoding_map: Optional[Dict[str, Dict[str, int]]] = None,
     data_fingerprint: str = "",
     prompt_fingerprint: str = "",
     prompt_version: str = "1.0",
-    max_rules: int = 20,
+    max_rules: int = 50,
     vllm_params: Optional[dict] = None,
     stats_ref_keys: Optional[set] = None,
+    max_final_rules: int = 12,
 ) -> RuleBank:
-    """完整生成管线：构建 prompt → 调用 LLM → 校验 → YAML 写出。
+    """完整生成管线：构建 prompt → 调用 LLM → 校验 → 数据筛选 → YAML。
 
     如果 LLM 调用或校验失败会自动降级到 fallback 规则集。
 
@@ -264,6 +267,9 @@ def generate_rulebank(
         输出的 RuleBank YAML 路径。
     llm_client:
         Qwen vLLM 客户端实例。
+    train_df:
+        训练集 DataFrame（含特征列和 Labels），用于筛选阶段计算统计指标。
+        为 None 时跳过 Stage 2/3 筛选，LLM risk_score/confidence 保持原值。
     encoding_map:
         {field_name: {str_value: int_id}}，用于字符串条件预校验。
     data_fingerprint:
@@ -324,6 +330,23 @@ def generate_rulebank(
         }
         logger.info("LLM generated %d rules (%d rejected)",
                     len(rules), report.get("rejected_count", 0))
+
+        # Stage 2 & 3 — 数据筛选 + 统计置信度（需要训练集数据）
+        if train_df is not None:
+            before = len(rules)
+            rules, kept_stats, removed_log = screen_rules(
+                rules, train_df, max_final=max_final_rules)
+            logger.info(
+                "Screening: %d → %d (stage2_removed=%d, stage3_removed=%d)",
+                before, len(rules),
+                removed_log.get("stage2_removed", 0),
+                removed_log.get("stage3_removed", 0),
+            )
+            generation_log["screening"] = {
+                "before": before,
+                "after": len(rules),
+                "removed_log": removed_log,
+            }
     else:
         logger.warning("LLM rule generation failed: %s; using fallback",
                        report.get("errors", "unknown"))
@@ -444,6 +467,275 @@ def _resolve_rule_values(rules: list, ref_map: dict) -> list:
     return rules
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 第 4 部分：规则筛选管线（生成 → 数据验证 → 去重 → 统计置信度）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _evaluate_rule_on_traindf(rule: Rule, train_df: pd.DataFrame,
+                               label_col: str = "Labels") -> dict:
+    """在训练 DataFrame 上计算单条规则的统计指标。
+
+    Returns
+    -------
+    dict with keys: support_pos, support_neg, coverage, precision, recall, lift
+    """
+    mask = pd.Series(True, index=train_df.index)
+    for clause in rule.clauses:
+        field = clause.get("field")
+        op = clause.get("operator")
+        val = clause.get("value")
+        if field is None or op is None or val is None:
+            mask = pd.Series(False, index=train_df.index)
+            break
+        if field not in train_df.columns:
+            mask = pd.Series(False, index=train_df.index)
+            break
+        col = train_df[field]
+        try:
+            # 字符串字段（Type/Target）直接比较原始值
+            is_string_field = field in ("Type", "Target")
+            if isinstance(val, (list, tuple)):
+                if op == "between" and len(val) == 2 and not is_string_field:
+                    mask &= (col >= float(val[0])) & (col <= float(val[1]))
+                elif op == "in":
+                    sub_mask = pd.Series(False, index=train_df.index)
+                    for v in val:
+                        sub_mask |= (col == v)
+                    mask &= sub_mask
+                elif op == "not_in":
+                    sub_mask = pd.Series(True, index=train_df.index)
+                    for v in val:
+                        sub_mask &= (col != v)
+                    mask &= sub_mask
+                else:
+                    mask = pd.Series(False, index=train_df.index)
+            else:
+                if is_string_field:
+                    mask &= col == val
+                else:
+                    val_f = float(val)
+                    if op == ">":           mask &= col > val_f
+                    elif op == "<":          mask &= col < val_f
+                    elif op == ">=":         mask &= col >= val_f
+                    elif op == "<=":         mask &= col <= val_f
+                    elif op == "==":         mask &= col == val_f
+                    else:
+                        mask = pd.Series(False, index=train_df.index)
+        except (TypeError, ValueError):
+            mask = pd.Series(False, index=train_df.index)
+            break
+
+    if label_col not in train_df.columns:
+        return {"support_pos": 0, "support_neg": 0, "coverage": 0.0,
+                "precision": 0.0, "recall": 0.0, "lift": 0.0}
+
+    positives = train_df[label_col] == 1
+    support_pos = int((mask & positives).sum())
+    support_neg = int((mask & ~positives).sum())
+    total_hits = support_pos + support_neg
+    coverage = total_hits / max(len(train_df), 1)
+    precision = support_pos / max(total_hits, 1)
+    total_pos = int(positives.sum())
+    recall = support_pos / max(total_pos, 1)
+    base_rate = total_pos / max(len(train_df), 1)
+    lift = precision / max(base_rate, 1e-8)
+    return {
+        "support_pos": support_pos, "support_neg": support_neg,
+        "coverage": round(coverage, 6), "precision": round(precision, 6),
+        "recall": round(recall, 6), "lift": round(lift, 4),
+    }
+
+
+def _compute_stats_confidence(stats_list: List[dict]) -> List[float]:
+    """基于统计量计算规则置信度。
+
+    formula:  confidence = precision * log(1 + support_pos)
+    然后归一化到 [0, 1]（最高分=1，最低分保留相对比例）。
+    """
+    raw = [
+        max(s["precision"], 0.0) * math.log1p(max(s["support_pos"], 0))
+        for s in stats_list
+    ]
+    max_raw = max(raw) if raw else 1.0
+    if max_raw <= 0:
+        return [0.0] * len(raw)
+    return [min(r / max_raw, 1.0) for r in raw]
+
+
+def _evaluate_rule_batch(rules: list, train_df: pd.DataFrame,
+                          label_col: str = "Labels") -> List[dict]:
+    """批量评估规则，返回每条规则的统计 dict 列表。"""
+    return [_evaluate_rule_on_traindf(r, train_df, label_col) for r in rules]
+
+
+def _jaccard_dedup(
+    rules: list, stats_list: List[dict], train_df: pd.DataFrame,
+    label_col: str = "Labels", threshold: float = 0.9,
+) -> tuple:
+    """Jaccard 去重：命中样本集合相似度 > threshold 的规则只保留一条。
+
+    Returns (kept_rules, kept_stats, removed_indices).
+    """
+    # 预先计算每条规则的命中掩码
+    hit_masks = []
+    for rule in rules:
+        mask = pd.Series(True, index=train_df.index)
+        for clause in rule.clauses:
+            field = clause.get("field")
+            op = clause.get("operator")
+            val = clause.get("value")
+            if field is None or op is None or val is None or field not in train_df.columns:
+                mask = pd.Series(False, index=train_df.index)
+                break
+            col = train_df[field]
+            try:
+                is_str = field in ("Type", "Target")
+                if isinstance(val, (list, tuple)):
+                    if op == "between" and len(val) == 2 and not is_str:
+                        mask &= (col >= float(val[0])) & (col <= float(val[1]))
+                    else:
+                        mask = pd.Series(False, index=train_df.index)
+                else:
+                    if is_str:
+                        mask &= col == val
+                    else:
+                        val_f = float(val)
+                        if op == ">":           mask &= col > val_f
+                        elif op == "<":          mask &= col < val_f
+                        elif op == ">=":         mask &= col >= val_f
+                        elif op == "<=":         mask &= col <= val_f
+                        elif op == "==":         mask &= col == val_f
+                        else:
+                            mask = pd.Series(False, index=train_df.index)
+            except (TypeError, ValueError):
+                mask = pd.Series(False, index=train_df.index)
+                break
+        hit_masks.append(mask)
+
+    n = len(rules)
+    keep = [True] * n
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
+                continue
+            union = (hit_masks[i] | hit_masks[j]).sum()
+            if union == 0:
+                continue
+            jaccard = (hit_masks[i] & hit_masks[j]).sum() / union
+            if jaccard > threshold:
+                # 保留验证表现更好的（precision 更高的）
+                if stats_list[i]["precision"] >= stats_list[j]["precision"]:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+                    break
+
+    kept_rules = [r for r, k in zip(rules, keep) if k]
+    kept_stats = [s for s, k in zip(stats_list, keep) if k]
+    removed = [i for i in range(n) if not keep[i]]
+    return kept_rules, kept_stats, removed
+
+
+def screen_rules(
+    rules: list,
+    train_df: pd.DataFrame,
+    label_col: str = "Labels",
+    max_final: int = 12,
+    min_support_pos: int = 2,
+    min_precision: float = 0.0,
+    max_coverage: float = 0.95,
+    min_recall: float = 0.0,
+    jaccard_threshold: float = 0.9,
+) -> tuple:
+    """三阶段规则筛选管线。
+
+    Stage 1 — 静态检查（已由 validate_llm_output 完成，此处不再重复）。
+    Stage 2 — 数据验证：在训练集上计算统计指标，过滤无效规则。
+    Stage 3 — Jaccard 去重：命中集高度重叠的规则只保留一条。
+
+    Parameters
+    ----------
+    rules:
+        通过静态校验的候选规则列表（Rule 对象）。
+    train_df:
+        训练集 DataFrame（必须包含特征列和 label_col）。
+    label_col:
+        标签列名称。
+    max_final:
+        最终保留的最大规则数。
+    min_support_pos:
+        最少命中正样本数（低于此值视为过拟合噪音）。
+    min_precision:
+        最小 precision（低于此值视为无区分力）。
+    max_coverage:
+        最大覆盖率（高于此值可能过于泛化）。
+    min_recall:
+        最小 recall（可选过滤条件）。
+    jaccard_threshold:
+        Jaccard 相似度阈值，超过则视为重复规则。
+
+    Returns
+    -------
+    (kept_rules, kept_stats, removed_log)
+    """
+    if not rules:
+        return [], [], {"stage2_removed": 0, "stage3_removed": 0}
+
+    # Stage 2 — 数据验证
+    stats_list = _evaluate_rule_batch(rules, train_df, label_col)
+    stage2_kept, stage2_stats = [], []
+    for r, s in zip(rules, stats_list):
+        if s["support_pos"] < min_support_pos:
+            logger.info("Screening reject (support_pos=%d < %d): %s",
+                        s["support_pos"], min_support_pos, r.name)
+            continue
+        if s["precision"] < min_precision:
+            logger.info("Screening reject (precision=%.4f < %.4f): %s",
+                        s["precision"], min_precision, r.name)
+            continue
+        if s["coverage"] > max_coverage:
+            logger.info("Screening reject (coverage=%.4f > %.4f): %s",
+                        s["coverage"], max_coverage, r.name)
+            continue
+        if s["recall"] < min_recall:
+            logger.info("Screening reject (recall=%.4f < %.4f): %s",
+                        s["recall"], min_recall, r.name)
+            continue
+        stage2_kept.append(r)
+        stage2_stats.append(s)
+
+    stage2_removed = len(rules) - len(stage2_kept)
+
+    # Stage 3 — Jaccard 去重
+    kept_rules, kept_stats, stage3_removed_indices = _jaccard_dedup(
+        stage2_kept, stage2_stats, train_df, label_col, jaccard_threshold)
+
+    # 统计置信度
+    confidences = _compute_stats_confidence(kept_stats)
+
+    # 按置信度排序，保留 top-N
+    indexed = list(zip(kept_rules, kept_stats, confidences))
+    indexed.sort(key=lambda x: x[2], reverse=True)
+    indexed = indexed[:max_final]
+
+    final_rules = []
+    for r, s, c in indexed:
+        # 覆盖 LLM 自报数值为统计计算值
+        r.risk_score = min(max(s["precision"] * 5.0, 0.0), 1.0)
+        r.base_confidence = c
+        final_rules.append(r)
+
+    removed_log = {
+        "stage2_removed": stage2_removed,
+        "stage3_removed": len(stage3_removed_indices),
+        "final_count": len(final_rules),
+    }
+    return final_rules, kept_stats, removed_log
+
+
 def _build_fallback_rules(ref_keys: set) -> List[Rule]:
     rules: List[Rule] = []
     for item in FALLBACK_RULES_DATA:
@@ -512,11 +804,14 @@ def load_or_generate_rulebank(
     stats = compute_training_statistics(processed, train_idx)
     if llm_client is None:
         llm_client = QwenRuleGenerator()
+    # 训练集子集，用于规则筛选阶段的数据验证
+    train_df = processed.iloc[train_idx] if "Labels" in processed.columns else None
     return generate_rulebank(
         stats=stats,
         prompt_path=prompt_path,
         output_path=rulebank_path,
         llm_client=llm_client,
+        train_df=train_df,
         encoding_map=encoding_map,
         data_fingerprint=data_fingerprint,
         **gen_kwargs,
