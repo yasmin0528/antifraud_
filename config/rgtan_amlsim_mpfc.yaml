@@ -1,0 +1,69 @@
+batch_size: 256
+hid_dim: 256
+lr: 0.001
+wd: 0.0001
+n_layers: 2
+dropout: [0.2, 0.1]
+device: "cuda:0"
+early_stopping: 5
+seed: 2023
+max_epochs: 10
+gated: true
+
+dataset: amlsim
+amlsim_variant: HI-Small
+data_path: data/AMLSIM
+split_mode: temporal
+amlsim_train_days: 14
+amlsim_val_days: 2
+
+use_ca1: true
+ca1_input_dim: 7
+ca1_k: 10
+ca1_hidden_dim: 64
+ca1_aux_weight: 0.05
+ca1_dropout: 0.1
+ca1_input_fields: ["log_amount_paid", "log_amount_received", "amount_norm", "time_diff", "payment_format_encoded", "cross_bank", "time_hour"]
+ca1_encoder_type: "gru"
+ca1_pooling: "attention"
+
+use_ca3: true
+ca3_warmup_epochs: 3
+ca3_num_prototypes: 16
+ca3_init_method: minibatch_kmeans
+ca3_init_split: train
+ca3_init_label: positive_only
+ca3_update: gradient
+ca3_use_ema: false
+ca3_use_group_id: false
+ca3_temperature: 0.2
+ca3_top_k: 3
+ca3_diversity_weight: 0.001
+ca3_diversity_margin: 0.5
+ca3_fusion: gated_residual
+ca3_gate_bias_init: -2.0
+ca3_gate_bias_final: -1.0
+ca3_anneal_epochs: 10
+ca3_dead_threshold: 3
+ca3_contrastive_weight: 0.1
+ca3_contrastive_temperature: 0.1
+ca3_entropy_gate_beta: 1.0
+
+use_mpfc: true
+mpfc_hidden_dim: 64
+mpfc_dropout: 0.1
+mpfc_gate_bias_init: -2.0
+mpfc_confidence_constrained: true
+mpfc_aggregation: noisy_or
+
+rulebank_path: config/rulebank/amlsim_rulebank_v1.yaml
+rulebank_force_generate: false
+vllm_api_url: "http://localhost:23333/v1/chat/completions"
+vllm_model: "qwen"
+vllm_max_tokens: 16384
+vllm_temperature: 0.3
+vllm_top_p: 0.95
+
+results_dir: results
+nei_att_heads:
+  amlsim: 1

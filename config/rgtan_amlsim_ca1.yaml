@@ -1,0 +1,32 @@
+batch_size: 256
+hid_dim: 256
+lr: 0.001
+wd: 0.0001
+n_layers: 2
+dropout: [0.2, 0.1]
+device: "cuda:0"
+early_stopping: 5
+seed: 2023
+max_epochs: 10
+gated: true
+
+dataset: amlsim
+amlsim_variant: HI-Small
+data_path: data/AMLSIM
+split_mode: temporal
+amlsim_train_days: 14
+amlsim_val_days: 2
+
+use_ca1: true
+ca1_input_dim: 7
+ca1_k: 10
+ca1_hidden_dim: 64
+ca1_aux_weight: 0.05
+ca1_dropout: 0.1
+ca1_input_fields: ["log_amount_paid", "log_amount_received", "amount_norm", "time_diff", "payment_format_encoded", "cross_bank", "time_hour"]
+ca1_encoder_type: "gru"
+ca1_pooling: "attention"
+
+results_dir: results
+nei_att_heads:
+  amlsim: 1

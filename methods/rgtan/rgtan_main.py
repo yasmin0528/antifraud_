@@ -31,6 +31,7 @@ from .rgtan_model import RGTAN
 from .evaluation import best_macro_f1_threshold
 from feature_engineering.data_process import preprocess_aml_for_gtan
 from feature_engineering.ca1_cache import load_or_build_aml_ca1_cache
+from datasets.amlsim import load_or_build_amlsim_ca1_cache
 from methods.modules.ca1 import CA1Encoder
 from methods.modules.ca3 import CA3PrototypeMemory
 from methods.modules.mpfc import MPFCDecisionFusion, binary_logits_to_risk_logit, MPFCOutput
@@ -223,7 +224,7 @@ def rgtan_ca1_main(feat_df, graph, train_idx, val_idx, test_idx, labels, args,
         cat_features=cat_feat, neigh_features=nei_feat, nei_att_head=nei_att_head,
         ca1_hidden_dim=args["ca1_hidden_dim"],
     ).to(device)
-    ca1 = CA1Encoder(4, args["ca1_hidden_dim"], args["ca1_dropout"],
+    ca1 = CA1Encoder(args.get("ca1_input_dim", 4), args["ca1_hidden_dim"], args["ca1_dropout"],
                      args["ca1_encoder_type"], args["ca1_pooling"]).to(device)
     lr = args["lr"] * np.sqrt(args["batch_size"] / 1024)
     optimizer = optim.Adam(list(model.parameters()) + list(ca1.parameters()),
@@ -462,7 +463,7 @@ def _rgtan_ca1_ca3_main_impl(feat_df, graph, train_idx, val_idx, test_idx, label
         drop=args["dropout"], device=device, gated=args["gated"], ref_df=feat_df,
         cat_features=cat_feat, neigh_features=nei_feat, nei_att_head=nei_att_head,
         ca1_hidden_dim=args["ca1_hidden_dim"]).to(device)
-    ca1 = CA1Encoder(4, args["ca1_hidden_dim"], args["ca1_dropout"],
+    ca1 = CA1Encoder(args.get("ca1_input_dim", 4), args["ca1_hidden_dim"], args["ca1_dropout"],
                      args["ca1_encoder_type"], args["ca1_pooling"]).to(device)
     ca3 = CA3PrototypeMemory(
         args["ca1_hidden_dim"], args["ca3_num_prototypes"], args["ca3_temperature"],
@@ -1465,18 +1466,29 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
     known_label_tensor = torch.full_like(label_tensor, 2)
     train_nodes_for_labels = torch.as_tensor(train_idx, dtype=torch.long, device=device)
     known_label_tensor[train_nodes_for_labels] = label_tensor[train_nodes_for_labels]
-    cache = load_or_build_aml_ca1_cache(args["_aml_processed_path"], args["ca1_cache_path"],
-                                        args["_aml_sample_ids"], args["ca1_k"],
-                                        args["_aml_amount_mean"], args["_aml_amount_std"])
+    # ── CA1 缓存 ──────────────────────────────────────────────────────
+    if args.get("dataset") == "amlsim":
+        processed_all = pd.read_csv(args["_amlsim_processed_path"])
+        cache = load_or_build_amlsim_ca1_cache(
+            processed_all, args["_amlsim_ca1_cache_path"],
+            args["_amlsim_sample_ids"], args["ca1_k"])
+        processed = processed_all
+    else:
+        cache = load_or_build_aml_ca1_cache(args["_aml_processed_path"], args["ca1_cache_path"],
+                                            args["_aml_sample_ids"], args["ca1_k"],
+                                            args["_aml_amount_mean"], args["_aml_amount_std"])
+        processed = pd.read_csv(args["_aml_processed_path"])
     ca1_sequence, ca1_len, ca1_mask = cache["sequence"], cache["sequence_len"], cache["padding_mask"]
 
     # ── RuleBank 加载 / 生成 ──────────────────────────────────────────
-    processed = pd.read_csv(args["_aml_processed_path"])
-    rulebank_path = args.get("rulebank_path",
-                             os.path.join("config", "rulebank", "aml_rulebank_v1.yaml"))
+    is_amlsim = args.get("dataset") == "amlsim"
+    _default_rulebank = "config/rulebank/amlsim_rulebank_v1.yaml" if is_amlsim \
+                        else "config/rulebank/aml_rulebank_v1.yaml"
+    rulebank_path = args.get("rulebank_path", _default_rulebank)
     prompt_path = args.get("prompt_path",
                            os.path.join("prompts", "rule_generation_v1.txt"))
-    data_fingerprint = sha256_file(args["_aml_processed_path"])
+    _processed_path = args["_amlsim_processed_path" if is_amlsim else "_aml_processed_path"]
+    data_fingerprint = sha256_file(_processed_path)
     force_generate = args.get("rulebank_force_generate", False)
 
     vllm_client = QwenRuleGenerator(
@@ -1521,7 +1533,7 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
         cat_features=cat_feat, neigh_features=nei_feat, nei_att_head=nei_att_head,
         ca1_hidden_dim=args["ca1_hidden_dim"]).to(device)
 
-    ca1 = CA1Encoder(4, args["ca1_hidden_dim"], args["ca1_dropout"],
+    ca1 = CA1Encoder(args.get("ca1_input_dim", 4), args["ca1_hidden_dim"], args["ca1_dropout"],
                      args["ca1_encoder_type"], args["ca1_pooling"]).to(device)
 
     ca3 = CA3PrototypeMemory(
@@ -1961,7 +1973,10 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
 
     assignment_df = pd.DataFrame(assignments)
     assignment_df.to_csv(os.path.join(run_dir, "prototype_assignments.csv"), index=False)
-    processed_ids = pd.read_csv(args["_aml_processed_path"])[["TX_ID", "AlertID"]]
+    _pp = args.get("_amlsim_processed_path") or args.get("_aml_processed_path")
+    processed_ids = pd.read_csv(_pp)[["TX_ID"]]
+    if "AlertID" in pd.read_csv(_pp).columns:
+        processed_ids = pd.read_csv(_pp)[["TX_ID", "AlertID"]]
     assignment_df["TX_ID"] = assignment_df["TX_ID"].astype(str)
     processed_ids["TX_ID"] = processed_ids["TX_ID"].astype(str)
     explained = assignment_df.merge(processed_ids, on="TX_ID", how="left")

@@ -39,23 +39,32 @@ def parse_args():
     elif method in ['gtan']:
         yaml_file = "config/gtan_aml_cfg.yaml" if dataset == "aml" else "config/gtan_cfg.yaml"
     elif method in ['rgtan']:
-        yaml_file = "config/rgtan_aml_cfg.yaml" if dataset == "aml" else "config/rgtan_cfg.yaml"
+        if dataset == "aml":
+            yaml_file = "config/rgtan_aml_cfg.yaml"
+        elif dataset == "amlsim":
+            yaml_file = "config/rgtan_amlsim_cfg.yaml"
+        else:
+            yaml_file = "config/rgtan_cfg.yaml"
     elif method in ['rgtan_ca1']:
-        if dataset != "aml":
-            raise ValueError("rgtan_ca1 currently supports only --dataset aml")
-        yaml_file = "config/rgtan_aml_ca1.yaml"
+        if dataset in ("aml", "amlsim"):
+            yaml_file = f"config/rgtan_{dataset}_ca1.yaml"
+        else:
+            raise ValueError("rgtan_ca1 supports only --dataset aml or amlsim")
     elif method in ['rgtan_ca1_ca3']:
-        if dataset != "aml":
-            raise ValueError("rgtan_ca1_ca3 currently supports only --dataset aml")
-        yaml_file = "config/rgtan_aml_ca1_ca3.yaml"
+        if dataset in ("aml", "amlsim"):
+            yaml_file = f"config/rgtan_{dataset}_ca1_ca3.yaml"
+        else:
+            raise ValueError("rgtan_ca1_ca3 supports only --dataset aml or amlsim")
     elif method in ['rgtan_mpfc']:
-        if dataset != "aml":
-            raise ValueError("rgtan_mpfc currently supports only --dataset aml")
-        yaml_file = "config/rgtan_aml_mpfc.yaml"
+        if dataset in ("aml", "amlsim"):
+            yaml_file = f"config/rgtan_{dataset}_mpfc.yaml"
+        else:
+            raise ValueError("rgtan_mpfc supports only --dataset aml or amlsim")
     elif method in ['rgtan_mpfc_vta']:
-        if dataset != "aml":
-            raise ValueError("rgtan_mpfc_vta currently supports only --dataset aml")
-        yaml_file = "config/rgtan_aml_mpfc_vta.yaml"
+        if dataset in ("aml", "amlsim"):
+            yaml_file = f"config/rgtan_{dataset}_mpfc_vta.yaml"
+        else:
+            raise ValueError("rgtan_mpfc_vta supports only --dataset aml or amlsim")
     elif method in ['hogrl']:
         yaml_file = "config/hogrl_cfg.yaml"
         
@@ -170,20 +179,36 @@ def main(args):
             rgtan_main, rgtan_aml_single_main, rgtan_ca1_main,
             rgtan_ca1_ca3_main, rgtan_mpfc_main, loda_rgtan_data,
         )
-        feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
-            args)
+        if args.get('dataset') == 'amlsim':
+            from datasets.amlsim import load_amlsim_data
+            feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = \
+                load_amlsim_data(args)
+            nei_key = 'amlsim'
+        else:
+            feat_data, labels, train_idx, test_idx, g, cat_features, neigh_features = loda_rgtan_data(
+                args)
+            nei_key = 'aml'
         if args['method'] in ('rgtan_mpfc', 'rgtan_mpfc_vta'):
             rgtan_mpfc_main(feat_data, g, train_idx, args['_val_idx'], test_idx, labels, args,
-                            cat_features, neigh_features, nei_att_head=args['nei_att_heads']['aml'])
+                            cat_features, neigh_features,
+                            nei_att_head=args['nei_att_heads'][nei_key])
         elif args['method'] == 'rgtan_ca1_ca3':
             rgtan_ca1_ca3_main(feat_data, g, train_idx, args['_val_idx'], test_idx, labels, args,
-                               cat_features, neigh_features, nei_att_head=args['nei_att_heads']['aml'])
+                               cat_features, neigh_features,
+                               nei_att_head=args['nei_att_heads'][nei_key])
         elif args['method'] == 'rgtan_ca1':
             rgtan_ca1_main(feat_data, g, train_idx, args['_val_idx'], test_idx, labels, args,
-                           cat_features, neigh_features, nei_att_head=args['nei_att_heads']['aml'])
+                           cat_features, neigh_features,
+                           nei_att_head=args['nei_att_heads'][nei_key])
         elif args['dataset'] == 'aml':
             rgtan_aml_single_main(feat_data, g, train_idx, args['_val_idx'], test_idx, labels, args,
-                                  cat_features, neigh_features, nei_att_head=args['nei_att_heads']['aml'])
+                                  cat_features, neigh_features,
+                                  nei_att_head=args['nei_att_heads']['aml'])
+        elif args['dataset'] == 'amlsim':
+            # AMLSIM baseline — use rgtan_mpfc_main with CA1/CA3/MPFC all disabled in config
+            rgtan_mpfc_main(feat_data, g, train_idx, args['_val_idx'], test_idx, labels, args,
+                            cat_features, neigh_features,
+                            nei_att_head=args['nei_att_heads']['amlsim'])
         else:
             rgtan_main(feat_data, g, train_idx, test_idx, labels, args,
                        cat_features, neigh_features, nei_att_head=args['nei_att_heads'][args['dataset']])
