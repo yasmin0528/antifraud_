@@ -1400,28 +1400,55 @@ def _build_rulebank_field_tensors(
 ) -> tuple:
     """为 RuleEngine 构建字段张量字典和 Type/Target 编码映射。
 
+    自动兼容 AMLSIM（Amount → AmountPaid 等别名），
+    缺失字段以零张量填充，确保不因字段名差异崩溃。
+
     返回 (field_tensors, encoding_map)：
       field_tensors: {field_name: [num_nodes, 1] tensor}
       encoding_map:  {field_name: {str_value: int_id}}
     """
-    encoding_map = {}
+    num_nodes = len(processed)
+
+    # 字段名别名映射（AMLSIM → 标准名）
+    FIELD_ALIASES = {
+        "Amount": ["Amount", "AmountPaid"],
+        "TimeDiff": ["TimeDiff"],
+        "SenderHistCount": ["SenderHistCount"],
+        "SenderHistAmountSum": ["SenderHistAmountSum"],
+        "SenderHistAmountMean": ["SenderHistAmountMean"],
+        "Time": ["Time"],
+    }
 
     field_tensors = {}
-    for field in ("Amount", "TimeDiff", "SenderHistCount",
-                  "SenderHistAmountSum", "SenderHistAmountMean", "Time"):
-        field_tensors[field] = (
-            torch.from_numpy(processed[field].astype(float).values)
-            .float().unsqueeze(1).to(device)
-        )
+    for field, aliases in FIELD_ALIASES.items():
+        matched_col = None
+        for alias in aliases:
+            if alias in processed.columns:
+                matched_col = alias
+                break
+        if matched_col is not None:
+            field_tensors[field] = (
+                torch.from_numpy(processed[matched_col].astype(float).values)
+                .float().unsqueeze(1).to(device)
+            )
+        else:
+            logger.warning("Field '%s' not found in processed data, using zero tensor", field)
+            field_tensors[field] = torch.zeros((num_nodes, 1), device=device)
 
+    # 分类字段（Type / Target）
+    encoding_map = {}
     for field in ("Type", "Target"):
-        raw = processed[field].astype(str)
-        le = LabelEncoder()
-        encoded = le.fit_transform(raw)
-        encoding_map[field] = dict(zip(le.classes_, le.transform(le.classes_)))
-        field_tensors[field] = (
-            torch.from_numpy(encoded).long().unsqueeze(1).to(device)
-        )
+        if field in processed.columns:
+            raw = processed[field].astype(str)
+            le = LabelEncoder()
+            encoded = le.fit_transform(raw)
+            encoding_map[field] = dict(zip(le.classes_, le.transform(le.classes_)))
+            field_tensors[field] = (
+                torch.from_numpy(encoded).long().unsqueeze(1).to(device)
+            )
+        else:
+            logger.warning("Categorical field '%s' not found, using zero tensor", field)
+            field_tensors[field] = torch.zeros((num_nodes, 1), dtype=torch.long, device=device)
 
     return field_tensors, encoding_map
 
@@ -1479,6 +1506,7 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                                             args["_aml_amount_mean"], args["_aml_amount_std"])
         processed = pd.read_csv(args["_aml_processed_path"])
     ca1_sequence, ca1_len, ca1_mask = cache["sequence"], cache["sequence_len"], cache["padding_mask"]
+    logger.info("CA1 cache loaded (%d rows x k=%d)", len(ca1_sequence), cache.get("k", 0))
 
     # ── RuleBank 加载 / 生成 ──────────────────────────────────────────
     is_amlsim = args.get("dataset") == "amlsim"
@@ -1506,8 +1534,11 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
         force=force_generate,
         prompt_version="1.0",
     )
+    logger.info("RuleBank loaded: %d active / %d total rules from %s",
+                len(rulebank.active_rules()), len(rulebank.rules), rulebank_path)
 
     # ── RuleEngine 字段张量与编码映射 ──────────────────────────────────
+    logger.info("Building RuleEngine field tensors ...")
     field_tensors, encoding_map = _build_rulebank_field_tensors(processed, device)
     rule_engine = RuleEngine(
         rulebank=rulebank,
@@ -1651,6 +1682,9 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                ca3_out, local, batch_labels, ca1_embedding, rule_score, rule_confidence
 
     # ── 训练循环 ──────────────────────────────────────────────────────
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info("Model setup complete: %d params, %d train/%d val/%d test batches",
+                total_params, len(train_loader), len(val_loader), len(test_loader))
     if warmup == 0:
         initialize_ca3()
         positive_emb_pool = build_positive_embedding_pool()
