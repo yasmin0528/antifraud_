@@ -115,7 +115,7 @@ def preprocess_amlsim(
     data["_day"] = (data["_datetime"] - data["_datetime"].min()).dt.days + 1  # 1-indexed
     data["_hour"] = data["_datetime"].dt.hour.astype(int)
     data["_dow"] = data["_datetime"].dt.dayofweek.astype(int)
-    data["_timestamp_s"] = data["_datetime"].astype(np.int64) // 10**9
+    data["_timestamp_s"] = data["_datetime"].view(np.int64) // 10**9
 
     # ── Account key (From side, used for sorting & CA1 grouping) ──────
     data["AccountKey"] = data["Account"].astype(str)  # From account
@@ -278,19 +278,6 @@ def build_amlsim_ca1_cache(
     account_col = "AccountKey"
     time_col = "Time"
 
-    # Build feature matrix (same order as processed)
-    feature_tensors = {}
-    for field in CA1_INPUT_FIELDS:
-        if field == "payment_format_encoded":
-            feature_tensors[field] = torch.from_numpy(
-                processed["PaymentFormat"].astype(float).values).float()
-        else:
-            feature_tensors[field] = torch.from_numpy(
-                processed[field.replace("amount_norm", "AmountPaid")  # approximate
-                          if field not in processed.columns else field]
-                .astype(float).values).float()
-
-    # Actually build the feature tensor directly from processed columns
     col_map = {
         "log_amount_paid": "LogAmountPaid",
         "log_amount_received": "LogAmountReceived",
