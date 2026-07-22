@@ -97,7 +97,7 @@ def preprocess_amlsim(
 
     # ── Read raw ──────────────────────────────────────────────────────
     logger.info("Reading transactions from %s ...", trans_path)
-    data = pd.read_csv(trans_path)
+    data = pd.read_csv(trans_path, low_memory=False)
     n_raw = len(data)
     logger.info("  rows: %d", n_raw)
 
