@@ -1965,9 +1965,10 @@ def _rgtan_mpfc_main_impl(feat_df, graph, train_idx, val_idx, test_idx, labels, 
                 vta_uncertainty = torch.zeros(valid.sum(), device=device)
                 vta_review = torch.zeros(valid.sum(), device=device)
 
+            sample_ids_key = "_amlsim_sample_ids" if is_amlsim else "_aml_sample_ids"
             for j, node_id in enumerate(seed_ids):
                 entry = {
-                    "TX_ID": args["_aml_sample_ids"][node_id],
+                    "TX_ID": args[sample_ids_key][node_id],
                     "label": int(batch_labels[valid][j].item()),
                     "rgtan_score": float(score[j].item()),
                     "mpfc_fusion_weight": float(mpfc_out.fusion_weight[valid][j].item()),

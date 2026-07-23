@@ -439,6 +439,40 @@ def _amlsim_temporal_split(
     return train_idx, val_idx, test_idx
 
 
+def _amlsim_random_split(
+    labels: pd.Series,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    seed: int = 2023,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Random stratified split by labels.
+
+    Avoids temporal bias — suitable when temporal distribution is skewed.
+    """
+    from sklearn.model_selection import train_test_split
+    n = len(labels)
+    indices = np.arange(n)
+    # First split: train vs temp (val+test)
+    train_idx, temp_idx = train_test_split(
+        indices, test_size=(1 - train_ratio), random_state=seed,
+        shuffle=True, stratify=labels,
+    )
+    # Second split: val vs test within temp
+    val_ratio_adj = val_ratio / (1 - train_ratio)
+    val_idx, test_idx = train_test_split(
+        temp_idx, test_size=(1 - val_ratio_adj), random_state=seed + 1,
+        shuffle=True,
+        stratify=labels.iloc[temp_idx] if labels.iloc[temp_idx].nunique() >= 2 else None,
+    )
+    logger.info(
+        "Random split: train=%d (%.1f%%), val=%d (%.1f%%), test=%d (%.1f%%)",
+        len(train_idx), 100 * train_ratio,
+        len(val_idx), 100 * val_ratio,
+        len(test_idx), 100 * (1 - train_ratio - val_ratio),
+    )
+    return train_idx, val_idx, test_idx
+
+
 # ── Neighbor features ───────────────────────────────────────────────────
 
 
@@ -529,11 +563,18 @@ def load_amlsim_data(args: dict) -> Tuple:
         feat_data = feat_data.drop(columns=list(present_forbidden))
         logger.info("Dropped forbidden columns: %s", sorted(present_forbidden))
 
-    # 5. Temporal split
-    train_days = int(args.get("amlsim_train_days", 14))
-    val_days = int(args.get("amlsim_val_days", 2))
-    train_idx, val_idx, test_idx = _amlsim_temporal_split(
-        processed, train_days=train_days, val_days=val_days)
+    # 5. Split (temporal or random percentage-based)
+    split_mode = args.get("split_mode", "temporal")
+    if split_mode == "random":
+        train_ratio = float(args.get("train_ratio", 0.7))
+        val_ratio = float(args.get("val_ratio", 0.15))
+        train_idx, val_idx, test_idx = _amlsim_random_split(
+            labels, train_ratio=train_ratio, val_ratio=val_ratio, seed=args.get("seed", 2023))
+    else:
+        train_days = int(args.get("amlsim_train_days", 14))
+        val_days = int(args.get("amlsim_val_days", 2))
+        train_idx, val_idx, test_idx = _amlsim_temporal_split(
+            processed, train_days=train_days, val_days=val_days)
 
     # 5a. Leakage audit
     try:

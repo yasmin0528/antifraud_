@@ -13,9 +13,9 @@ gated: true
 dataset: amlsim
 amlsim_variant: HI-Small
 data_path: data/AMLSIM
-split_mode: temporal
-amlsim_train_days: 14
-amlsim_val_days: 2
+split_mode: random
+train_ratio: 0.7
+val_ratio: 0.15
 
 use_ca1: true
 ca1_input_dim: 7
