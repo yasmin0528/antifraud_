@@ -13,8 +13,15 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT = os.path.abspath(os.path.join(_HERE, ".."))
