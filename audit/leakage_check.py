@@ -100,7 +100,8 @@ def check_account_split_overlap(
         "test": set(processed.iloc[test_idx][account_col].astype(str)),
     }
     overlaps = {}
-    for (n1, s1), (n2, s2) in [("train", "val"), ("train", "test"), ("val", "test")]:
+    for n1, n2 in [("train", "val"), ("train", "test"), ("val", "test")]:
+        s1, s2 = splits[n1], splits[n2]
         inter = s1 & s2
         overlaps[f"{n1}_{n2}_overlap"] = len(inter)
     return {
