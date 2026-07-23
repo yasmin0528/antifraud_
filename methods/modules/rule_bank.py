@@ -31,6 +31,9 @@ ALLOWED_FIELDS = frozenset({
     "Amount", "TimeDiff",
     "SenderHistCount", "SenderHistAmountSum", "SenderHistAmountMean",
     "Time", "Type", "Target",
+    "AmountPaid", "AmountReceived", "LogAmountPaid", "LogAmountReceived",
+    "CrossBank", "TimeHour", "TimeDayOfWeek",
+    "PaymentFormat", "CurrencyPaid", "CurrencyReceived", "FromBank", "ToBank",
 })
 
 ALLOWED_OPERATORS = frozenset({

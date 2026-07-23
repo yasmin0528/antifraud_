@@ -1412,11 +1412,22 @@ def _build_rulebank_field_tensors(
     # 字段名别名映射（AMLSIM → 标准名）
     FIELD_ALIASES = {
         "Amount": ["Amount", "AmountPaid"],
+        "AmountReceived": ["AmountReceived"],
+        "LogAmountPaid": ["LogAmountPaid"],
+        "LogAmountReceived": ["LogAmountReceived"],
         "TimeDiff": ["TimeDiff"],
         "SenderHistCount": ["SenderHistCount"],
         "SenderHistAmountSum": ["SenderHistAmountSum"],
         "SenderHistAmountMean": ["SenderHistAmountMean"],
         "Time": ["Time"],
+        "CrossBank": ["CrossBank"],
+        "TimeHour": ["TimeHour"],
+        "TimeDayOfWeek": ["TimeDayOfWeek"],
+        "PaymentFormat": ["PaymentFormat"],
+        "CurrencyPaid": ["CurrencyPaid"],
+        "CurrencyReceived": ["CurrencyReceived"],
+        "FromBank": ["FromBank"],
+        "ToBank": ["ToBank"],
     }
 
     field_tensors = {}
